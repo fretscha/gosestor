@@ -3,7 +3,9 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"time"
 
@@ -162,3 +164,93 @@ func (l *Live) NewProxyCookie() (string, bool) {
 	}
 	return "", false
 }
+
+// StoreCookie writes a cached cookie, skipping the write when the value is
+// unchanged (VALUE_SHA dedupe).
+func (l *Live) StoreCookie(ctx context.Context, name, value string) error {
+	sum := sha256.Sum256([]byte(value))
+	sha := base64.RawURLEncoding.EncodeToString(sum[:])
+	if l.shas[name] == sha {
+		return nil // unchanged; skip rewrite
+	}
+	if err := l.m.store.PutCookie(ctx, l.SessionID, name, value, sha); err != nil {
+		return err
+	}
+	l.Cookies[name] = value
+	l.shas[name] = sha
+	return nil
+}
+
+// BindOwner sets OWNER_ID when it changes and rotates the KEY_ID on that
+// transition (fixation defense). No-op when ownerID equals the current owner.
+func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
+	if ownerID == l.OwnerID {
+		return false, nil
+	}
+	now := l.m.clock.Now().Unix()
+	sess, err := l.m.store.GetSession(ctx, l.SessionID)
+	if err != nil {
+		return false, err
+	}
+	sess.OwnerID = ownerID
+	sess.LastAccess = now
+	ttl := l.m.ttl(sess, now)
+	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
+		return false, err
+	}
+	if err := l.m.store.AddOwnerIndex(ctx, ownerID, l.SessionID); err != nil {
+		return false, err
+	}
+	// Rotate: mint a new key, keep the old one alive for the grace window.
+	newKey, err := l.m.newID()
+	if err != nil {
+		return false, err
+	}
+	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
+		return false, err
+	}
+	if err := l.m.store.SetKeyTTL(ctx, l.KeyID, l.m.cfg.Grace); err != nil {
+		return false, err
+	}
+	l.OwnerID = ownerID
+	l.KeyID = newKey
+	l.newKey = newKey
+	l.rewrite = true
+	return true, nil
+}
+
+// RevokeOwner deletes every session bound to an owner (logout-everywhere).
+func (m *Manager) RevokeOwner(ctx context.Context, ownerID int64) error {
+	sids, err := m.store.OwnerSessions(ctx, ownerID)
+	if err != nil {
+		return err
+	}
+	for _, sid := range sids {
+		if err := m.store.DeleteSession(ctx, sid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WithLock serializes same-session work when Synchronize is enabled. When it
+// is disabled, fn runs directly. A failure to acquire the lock is surfaced so
+// the caller can apply fail_closed.
+func (m *Manager) WithLock(ctx context.Context, sessionID string, fn func() error) error {
+	if !m.cfg.Synchronize {
+		return fn()
+	}
+	unlock, ok, err := m.store.Lock(ctx, sessionID, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrLockContended
+	}
+	defer func() { _ = unlock(ctx) }()
+	return fn()
+}
+
+// ErrLockContended is returned when synchronize_sessions is on and the
+// per-session lock is already held; the handler maps it through on_store_error.
+var ErrLockContended = errors.New("session: lock contended")
