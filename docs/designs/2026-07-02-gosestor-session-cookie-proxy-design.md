@@ -48,14 +48,19 @@ CREATE TABLE attribute (
 
 ### Goals (v1)
 - Caddy plugin exposing a `session_store` handler directive.
-- Name-based cookie filter deciding, per backend `Set-Cookie`, **store server-side**
-  vs **pass through to client**. Default = pass-through; only named cookies stored.
+- Name-based cookie filter with **three outcomes, deny-by-default**: explicitly
+  named cookies are **forwarded** (→ client) or **stored** (→ server-side); every
+  other backend `Set-Cookie` is **dropped** (neither forwarded nor stored).
 - Opaque proxy cookie holding a rotatable `KEY_ID`; stable internal `SESSION_ID`.
 - KEY_ID rotation on identity change (fixation defense) with a grace window.
 - Cached-cookie re-injection toward the backend on the request path.
 - Owner binding: `OWNER_ID` = authenticated integer user id, sourced from a backend
   response header, stripped before reaching the client; revoke-by-owner supported.
+- Anti-spoofing: the `identity_header` is stripped from the **inbound request** so a
+  client can never forge identity — only the backend may assert it.
 - Dual timeouts: sliding `INACTIVE_TIMEOUT` + absolute `FINAL_TIMEOUT`.
+- Optional session synchronization (`synchronize_sessions`, default off): serialize
+  concurrent requests within the same session to avoid cookie collisions.
 - Pluggable `SessionStore` interface; Redis-compatible implementation (go-redis).
 - `fail_closed` default when the store is unreachable.
 
@@ -87,8 +92,10 @@ CREATE TABLE attribute (
 ### Components
 1. **`Handler`** (`caddyhttp.MiddlewareHandler`) — the Caddy directive; orchestrates
    request-in / response-out. Holds config + a `SessionStore`. Thin; delegates.
-2. **`CookieFilter`** — pure decision logic (name + rules → `PassThrough` | `Store`).
-   No I/O. Table-driven unit tests.
+2. **`CookieFilter`** — pure decision logic. Two configured lists only, `forward` and
+   `store`; the outcome is `Forward` | `Store` | `Drop`, where `Drop` is the implicit
+   default for any cookie in neither list (never configured explicitly). No I/O.
+   Table-driven unit tests.
 3. **`SessionManager`** — session/key lifecycle: create, resolve KEY_ID→SESSION_ID,
    rotate KEY_ID, set OWNER_ID, enforce timeouts, get/set/delete attributes. Depends
    only on `SessionStore` and an injected `Clock`.
@@ -113,6 +120,9 @@ gosestor/
 ## 4. Data Flow
 
 ### Request path (client → backend)
+0. **Strip any client-supplied `identity_header`** (e.g. `X-Auth-User`) from the inbound
+   request before anything else, so a browser can never forge owner identity. Only the
+   backend may assert identity (response path, step 5).
 1. Extract proxy cookie (config name, default `__gosestor`). Absent → no session; pass through.
 2. Resolve `KEY_ID → SESSION_ID` via key_id_map. Miss/expired → treat as no session
    (optionally clear the client cookie).
@@ -123,9 +133,11 @@ gosestor/
 ### Response path (backend → client)
 5. Read `identity_header` (e.g. `X-Auth-User`); if present, set/refresh `OWNER_ID`,
    `SADD` to the owner index, **strip the header**, and trigger KEY_ID rotation.
-6. For each backend `Set-Cookie`: `CookieFilter` decides — **pass through** (leave in
-   response) or **store** (write as attribute via `SessionManager`, remove from
-   response). `VALUE_SHA` skips rewriting unchanged values.
+6. For each backend `Set-Cookie`: `CookieFilter` returns one of three outcomes —
+   **Forward** (named in `forward`: leave it in the response), **Store** (named in
+   `store`: write as attribute via `SessionManager`, remove from response), or **Drop**
+   (default for any unlisted cookie: remove from response, do not store). `VALUE_SHA`
+   skips rewriting unchanged stored values.
 7. Ensure the client has a valid proxy cookie (create session + KEY_ID on first store;
    emit rotated KEY_ID if rotation triggered) with `HttpOnly; Secure; SameSite`.
 
@@ -175,10 +187,35 @@ Rotation swaps the client-facing `KEY_ID` while keeping `SESSION_ID` and attribu
 
 ## 8. Owner Binding & Revocation
 
-- On identity-header presence, set `OWNER_ID` and `SADD gs:owner:{id} {SESSION_ID}`.
+- The `identity_header` is **stripped from the inbound request** (request path step 0)
+  so only the backend can assert identity; a forged client header never reaches the app
+  or gosestor's binding logic.
+- On identity-header presence in the **response**, set `OWNER_ID` and
+  `SADD gs:owner:{id} {SESSION_ID}`, then strip it from the response.
 - `RevokeOwner(id)` deletes every session in `gs:owner:{id}` (keys/attrs included) — one
   call kills all of a user's sessions (logout-everywhere / breach response). Exposed on
   `SessionManager`; admin endpoint wiring deferred.
+
+## 8a. Session Synchronization (`synchronize_sessions`)
+
+Advanced, optional, and **disabled by default**. It serializes concurrent
+backend requests belonging to the same session.
+
+When two or more requests within the *same session* hit the backend concurrently, both
+response paths may write cached cookies and/or rotate the KEY_ID at once, racing on the
+same attribute hash — the classic "cookie collision" (a stale cookie value clobbering a
+fresh one).
+
+- **`false` (default)** — no locking. Writes rely on grouped writes + Redis per-op
+  atomicity. Fine for the common case where a session rarely has truly simultaneous
+  backend round-trips.
+- **`true`** — gosestor takes a **per-session distributed lock** (Redis `SET NX PX`
+  lock keyed `gs:lock:{SESSION_ID}`, released in a deferred step, with a bounded TTL so a
+  crashed holder can't wedge the session) around the read-modify-write of session state,
+  serializing concurrent same-session requests. Adds latency under contention; use only
+  when the backend is sensitive to concurrent cookie churn.
+
+Lock acquisition failure/timeout is governed by `on_store_error` (fail-closed by default).
 
 ## 9. Configuration (Caddyfile)
 
@@ -193,18 +230,23 @@ example.com {
         }
         cookie {
             name       __gosestor
-            path       /
+            # path is optional: if omitted, NO Path attribute is written on the cookie
             same_site  lax            # lax | strict | none
             # http_only + secure ON by default; `insecure` disables secure (dev only)
         }
-        store    JSESSIONID sessionid csrftoken   # cookies to swallow + store
-        # allow  X-Custom                         # optional explicit pass-through
+
+        # Deny-by-default cookie filter. Anything not named here is DROPPED
+        # (neither forwarded to the client nor stored). There is no `drop` directive.
+        forward  XSRF-TOKEN                        # backend Set-Cookie → passed to client
+        store    JSESSIONID sessionid csrftoken    # backend Set-Cookie → swallowed + stored
+
         inactive_timeout  30m
         final_timeout     8h
-        identity_header   X-Auth-User             # stripped before reaching client
+        identity_header   X-Auth-User             # stripped from request AND response
         rotate_on_login   true
         rotate_interval   0                        # 0 = periodic rotation off
         rotate_grace      60s
+        synchronize_sessions  false                # advanced: serialize concurrent same-session requests
         on_store_error    fail_closed              # fail_closed | fail_open
     }
     reverse_proxy backend:8080
@@ -230,17 +272,22 @@ placeholders, never inline.
 
 ## 11. Testing Strategy (TDD, behavior-focused)
 
-- **`CookieFilter`** — table-driven unit tests across allow/deny/default configs. Pure.
+- **`CookieFilter`** — table-driven unit tests: forward / store / drop-by-default across
+  configs, including an unlisted cookie asserting `Drop`. Pure.
 - **`SessionManager`** — tested against the in-memory `SessionStore` fake and against
   Redis via `miniredis`. Covers create, resolve, rotate (incl. grace), inactive vs final
   expiry, owner index, revoke-by-owner. Time advanced via injected `Clock`.
 - **`RedisStore`** — contract tests against `miniredis` and (behind a build tag) a real
   containerized Redis for parity.
 - **`Handler`** — `caddytest` integration in front of a stub backend emitting
-  `Set-Cookie` + `X-Auth-User`. Asserts: (a) named cookies never reach the client,
-  (b) client gets only the proxy cookie, (c) second request re-injects cached cookies,
-  (d) identity header stripped, (e) rotation emits new KEY_ID on login, (f) fail-closed
-  returns the error status when Redis is down.
+  `Set-Cookie` + `X-Auth-User`. Asserts: (a) `store` cookies never reach the client,
+  (b) `forward` cookies do reach the client, (c) unlisted cookies are dropped (neither
+  forwarded nor stored), (d) client gets the proxy cookie, (e) second request re-injects
+  cached cookies to the backend, (f) a client-supplied `X-Auth-User` is stripped from the
+  request, (g) the backend's `X-Auth-User` is stripped from the response, (h) rotation
+  emits a new KEY_ID on login, (i) fail-closed returns the error status when Redis is down.
+- **Session synchronization** — with `synchronize_sessions true`, concurrent same-session
+  requests serialize (no lost cookie write); lock TTL releases a crashed holder.
 
 ## 12. Dependencies
 
