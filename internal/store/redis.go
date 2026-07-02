@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"strconv"
 	"time"
 
@@ -123,7 +125,7 @@ func (r *Redis) Refresh(ctx context.Context, sessionID string, ttl time.Duration
 	if ttl <= 0 {
 		return nil
 	}
-	pipe := r.c.Pipeline()
+	pipe := r.c.TxPipeline()
 	pipe.Expire(ctx, r.sessKey(sessionID), ttl)
 	pipe.Expire(ctx, r.attrKey(sessionID), ttl)
 	pipe.Expire(ctx, r.shaKey(sessionID), ttl)
@@ -134,10 +136,12 @@ func (r *Redis) Refresh(ctx context.Context, sessionID string, ttl time.Duration
 
 // Lock uses SET NX PX. unlock deletes the token only if we still own it.
 func (r *Redis) Lock(ctx context.Context, sessionID string, ttl time.Duration) (func(context.Context) error, bool, error) {
-	// token is derived from a monotonic-ish source that is unique per call;
-	// crypto/rand is used by the Manager elsewhere, here the lock value need
-	// only be unique enough to prevent releasing someone else's lock.
-	token := strconv.FormatInt(time.Now().UnixNano(), 36)
+	// token is derived from crypto/rand to prevent stale unlocks releasing another holder's lock.
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return nil, false, err
+	}
+	token := hex.EncodeToString(buf)
 	ok, err := r.c.SetNX(ctx, r.lockKey(sessionID), token, ttl).Result()
 	if err != nil || !ok {
 		return nil, false, err
