@@ -181,8 +181,11 @@ Rotation swaps the client-facing `KEY_ID` while keeping `SESSION_ID` and attribu
    absorbs in-flight concurrent requests still carrying the old cookie.
 
 **Triggers (v1):**
-- **Identity change** — `OWNER_ID` transitions 0→user or user→different-user
-  (login / re-auth / privilege change). A pre-login KEY_ID is never reusable post-login.
+- **Identity change** — fires **only on an `OWNER_ID` transition** (0→user or
+  user→different-user). Because the backend re-asserts `identity_header` on every
+  authenticated response, rotation compares the incoming id against the stored
+  `OWNER_ID` and rotates only when they differ — never on every authenticated response.
+  A pre-login KEY_ID is thus never reusable post-login.
 - **Optional periodic** — rotate if `now − last_rotation ≥ rotate_interval` (default off).
 
 ## 8. Owner Binding & Revocation
