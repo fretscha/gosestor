@@ -16,7 +16,6 @@ import (
 type Config struct {
 	Inactive    time.Duration
 	Final       time.Duration
-	Grace       time.Duration
 	Synchronize bool
 }
 
@@ -204,11 +203,12 @@ func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
 	if err := l.m.store.AddOwnerIndex(ctx, ownerID, l.SessionID); err != nil {
 		return false, err
 	}
-	// Rotate: mint a new key, keep the old one alive for the grace window.
+	// Rotate: mint a new key and hard-delete the old one (session-fixation defense).
 	newKey, err := l.m.newID()
 	if err != nil {
 		return false, err
 	}
+	// PutKey before DeleteKey: on a partial store failure the new key is orphaned but is never issued to the client.
 	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
 		return false, err
 	}

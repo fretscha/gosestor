@@ -55,7 +55,6 @@ type Handler struct {
 	IdentityHeader  string         `json:"identity_header,omitempty"`
 	RotateOnLogin   bool           `json:"rotate_on_login,omitempty"`
 	RotateInterval  caddy.Duration `json:"rotate_interval,omitempty"`
-	RotateGrace     caddy.Duration `json:"rotate_grace,omitempty"`
 	Synchronize     bool           `json:"synchronize_sessions,omitempty"`
 	OnStoreError    string         `json:"on_store_error,omitempty"`
 
@@ -190,15 +189,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.RotateInterval = caddy.Duration(dur)
-			case "rotate_grace":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := time.ParseDuration(d.Val())
-				if err != nil {
-					return err
-				}
-				h.RotateGrace = caddy.Duration(dur)
 			case "synchronize_sessions":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -225,9 +215,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.FinalTimeout == 0 {
 		h.FinalTimeout = caddy.Duration(8 * time.Hour)
 	}
-	if h.RotateGrace == 0 {
-		h.RotateGrace = caddy.Duration(60 * time.Second)
-	}
 	client := redis.NewClient(&redis.Options{
 		Addr: h.Redis.Address, Password: h.Redis.Password, DB: h.Redis.DB,
 	})
@@ -236,7 +223,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.manager = session.NewManager(h.store, session.RealClock{}, session.Config{
 		Inactive:    time.Duration(h.InactiveTimeout),
 		Final:       time.Duration(h.FinalTimeout),
-		Grace:       time.Duration(h.RotateGrace),
 		Synchronize: h.Synchronize,
 	}, nil)
 	return nil

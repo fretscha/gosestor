@@ -25,7 +25,6 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		inactive_timeout 30m
 		final_timeout 8h
 		identity_header X-Auth-User
-		rotate_grace 60s
 		synchronize_sessions false
 		on_store_error fail_closed
 	}`

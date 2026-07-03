@@ -37,7 +37,6 @@ func newTestManager(clk Clock) (*Manager, *store.Memory) {
 	m := NewManager(st, clk, Config{
 		Inactive: 30 * time.Minute,
 		Final:    8 * time.Hour,
-		Grace:    time.Minute,
 	}, fixedRand())
 	return m, st
 }
