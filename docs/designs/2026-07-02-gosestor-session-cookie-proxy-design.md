@@ -52,7 +52,7 @@ CREATE TABLE attribute (
   named cookies are **forwarded** (→ client) or **stored** (→ server-side); every
   other backend `Set-Cookie` is **dropped** (neither forwarded nor stored).
 - Opaque proxy cookie holding a rotatable `KEY_ID`; stable internal `SESSION_ID`.
-- KEY_ID rotation on identity change (fixation defense) with a grace window.
+- KEY_ID rotation on identity change (fixation defense); old key hard-deleted (no grace).
 - Cached-cookie re-injection toward the backend on the request path.
 - Owner binding: `OWNER_ID` = authenticated integer user id, sourced from a backend
   response header, stripped before reaching the client; revoke-by-owner supported.
@@ -177,8 +177,14 @@ Rotation swaps the client-facing `KEY_ID` while keeping `SESSION_ID` and attribu
 
 1. Generate `KEY_ID₂`; `SET gs:key:{KEY_ID₂} = SESSION_ID`; add to the session key-set.
 2. Emit the new proxy cookie to the client.
-3. Old `KEY_ID₁` kept with a short **grace TTL** (default 60s, config) then deleted —
-   absorbs in-flight concurrent requests still carrying the old cookie.
+3. **Hard-delete** the old `KEY_ID₁` immediately (no grace window). A grace window was
+   considered but rejected: because `Resolve` slides any live key's TTL back to the full
+   inactive window, a graced pre-login key could be used *after* login and renewed
+   indefinitely — defeating the fixation defense. Immediate deletion closes that window
+   entirely. Trade-off: a concurrent in-flight request still carrying the old key at the
+   login instant falls back to a fresh (unauthenticated) session; this is rare and low
+   impact. (`PutKey` precedes `DeleteKey`; on a partial store failure the new key is
+   orphaned but is never issued to the client.)
 
 **Triggers (v1):**
 - **Identity change** — fires **only on an `OWNER_ID` transition** (0→user or
@@ -248,7 +254,7 @@ example.com {
         identity_header   X-Auth-User             # stripped from request AND response
         rotate_on_login   true
         rotate_interval   0                        # 0 = periodic rotation off
-        rotate_grace      60s
+        # (no rotate_grace: the old KEY_ID is hard-deleted on rotation — see §7)
         synchronize_sessions  false                # advanced: serialize concurrent same-session requests
         on_store_error    fail_closed              # fail_closed | fail_open
     }
@@ -264,7 +270,17 @@ placeholders, never inline.
 - **Store unreachable** — governed by `on_store_error`:
   - `fail_closed` (**default**, security-first): do not pass raw backend cookies to the
     client and do not serve a half-session; return `502` (configurable status) + logged.
-  - `fail_open`: pass the request through untouched (availability over cache guarantee).
+  - `fail_open`: serve the request rather than 502 (availability over cache guarantee).
+- **Secret scrubbing on any response-path failure** — regardless of `on_store_error`, if
+  response processing errors (including a contended session lock), *all* `Set-Cookie`
+  headers and the identity header are stripped before the response is flushed, so backend
+  secrets never leak. Note the availability trade-off under `fail_open`: a `forward`-listed
+  cookie (e.g. a CSRF token) emitted during a transient store hiccup is also dropped.
+- **Upstream cookie rewrite** — before proxying, the inbound `Cookie` header is rewritten:
+  the proxy cookie (`KEY_ID`) is stripped so it never reaches the backend, client-supplied
+  copies of `store`-managed cookie names are dropped (server value is authoritative;
+  anti-smuggling), then the cached server-held values are injected. Runs even with no live
+  session.
 - **Logging** — Caddy `zap` structured logs with context: **hashed** session/key ids
   (never raw secrets), operation, upstream error. No generic errors.
 - **Partial writes** — a response's attribute writes are grouped so a mid-write failure
@@ -278,8 +294,9 @@ placeholders, never inline.
 - **`CookieFilter`** — table-driven unit tests: forward / store / drop-by-default across
   configs, including an unlisted cookie asserting `Drop`. Pure.
 - **`SessionManager`** — tested against the in-memory `SessionStore` fake and against
-  Redis via `miniredis`. Covers create, resolve, rotate (incl. grace), inactive vs final
-  expiry, owner index, revoke-by-owner. Time advanced via injected `Clock`.
+  Redis via `miniredis`. Covers create, resolve, rotate (incl. old-key invalidation after
+  rotation), inactive vs final expiry, owner index, revoke-by-owner. Time advanced via
+  injected `Clock`.
 - **`RedisStore`** — contract tests against `miniredis` and (behind a build tag) a real
   containerized Redis for parity.
 - **`Handler`** — `caddytest` integration in front of a stub backend emitting
