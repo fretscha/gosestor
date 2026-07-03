@@ -1,0 +1,31 @@
+{
+	# Demo runs over plain HTTP on :80 inside the container.
+	admin off
+	auto_https off
+	# session_store is a custom handler, so its position in the middleware chain
+	# must be declared explicitly (it runs before the reverse proxy).
+	order session_store before reverse_proxy
+}
+
+:80 {
+	session_store {
+		redis {
+			address redis:6379
+		}
+		cookie {
+			name __gosestor
+			# Demo is plain HTTP; without `insecure` the Secure attribute would
+			# stop the browser/curl from ever sending the cookie back. Do NOT use
+			# `insecure` in production (serve over HTTPS instead).
+			insecure
+		}
+		# Deny-by-default: only these names are acted on, everything else is dropped.
+		forward XSRF-TOKEN
+		store JSESSIONID
+		identity_header X-Auth-User
+		inactive_timeout 30m
+		final_timeout 8h
+		on_store_error fail_closed
+	}
+	reverse_proxy backend:8080
+}

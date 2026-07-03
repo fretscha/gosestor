@@ -1,0 +1,7 @@
+# Keep the Docker build context small. xcaddy only needs the Go module source.
+.git
+.gitignore
+docs
+buildenv_*
+*.md
+demo/demo.sh

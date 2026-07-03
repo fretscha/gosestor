@@ -1,0 +1,26 @@
+# Docker demo for the gosestor session_store Caddy plugin.
+#
+#   docker compose up --build
+#   ./demo.sh            # in another terminal (walkthrough via curl)
+#
+# The proxy is reachable on http://localhost:8080.
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+
+  proxy:
+    build:
+      # Build context is the repo root so xcaddy can compile the local module.
+      context: ..
+      dockerfile: demo/Dockerfile
+    depends_on:
+      - redis
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
