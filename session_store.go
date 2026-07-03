@@ -1,8 +1,14 @@
 package gosestor
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -252,7 +258,220 @@ var (
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
 
-// ServeHTTP is implemented in Task 9; temporary stub keeps this task compiling.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	return next.ServeHTTP(w, r)
+	ctx := r.Context()
+
+	// (0) Anti-spoof: never trust a client-supplied identity header.
+	r.Header.Del(h.IdentityHeader)
+
+	// (1-4) Resolve any existing session and inject cached cookies upstream.
+	var live *session.Live
+	if c, err := r.Cookie(h.Cookie.Name); err == nil {
+		l, err := h.manager.Resolve(ctx, c.Value)
+		if err != nil {
+			return h.storeError(w, "resolve", err)
+		}
+		live = l
+	}
+	if live != nil {
+		injectCookies(r, live.Cookies)
+	}
+
+	// Response interception: process Set-Cookie + identity header before flush.
+	ic := &interceptor{ResponseWriter: w, h: h, r: r, live: live, ctx: ctx}
+	err := next.ServeHTTP(ic, r)
+	if err != nil {
+		return err
+	}
+	// If body was never written (e.g. 0-length), ensure headers are processed.
+	ic.ensureProcessed()
+	if ic.storeErr != nil {
+		return ic.storeErr
+	}
+	return nil
+}
+
+// injectCookies merges cached cookies into the outbound Cookie header so the
+// backend sees its own cookies as if the client had sent them.
+func injectCookies(r *http.Request, cached map[string]string) {
+	if len(cached) == 0 {
+		return
+	}
+	existing := map[string]bool{}
+	for _, c := range r.Cookies() {
+		existing[c.Name] = true
+	}
+	var b strings.Builder
+	b.WriteString(r.Header.Get("Cookie"))
+	for name, val := range cached {
+		if existing[name] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(name)
+		b.WriteString("=")
+		b.WriteString(val)
+	}
+	r.Header.Set("Cookie", b.String())
+}
+
+func (h *Handler) storeError(w http.ResponseWriter, op string, err error) error {
+	h.logger.Error("session store error", zap.String("op", op), zap.Error(err))
+	if h.OnStoreError == "fail_open" {
+		return nil
+	}
+	w.WriteHeader(http.StatusBadGateway)
+	return nil
+}
+
+// interceptor rewrites response headers (Set-Cookie, identity) exactly once,
+// just before the first Write/WriteHeader.
+type interceptor struct {
+	http.ResponseWriter
+	h        *Handler
+	r        *http.Request
+	live     *session.Live
+	ctx      context.Context
+	once     sync.Once
+	failed   bool
+	storeErr error
+}
+
+func (ic *interceptor) WriteHeader(status int) {
+	ic.ensureProcessed()
+	if ic.failed {
+		ic.ResponseWriter.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	ic.ResponseWriter.WriteHeader(status)
+}
+
+func (ic *interceptor) Write(b []byte) (int, error) {
+	ic.ensureProcessed()
+	if ic.failed {
+		return len(b), nil // swallow upstream body on fail_closed
+	}
+	return ic.ResponseWriter.Write(b)
+}
+
+func (ic *interceptor) ensureProcessed() {
+	ic.once.Do(func() {
+		if err := ic.process(); err != nil {
+			ic.h.logger.Error("session store error",
+				zap.String("op", "response"), zap.Error(err))
+			if ic.h.OnStoreError == "fail_closed" {
+				ic.failed = true
+				ic.storeErr = err
+			}
+		}
+	})
+}
+
+// process runs the response-path logic under an optional per-session lock.
+func (ic *interceptor) process() error {
+	run := func() error { return ic.processLocked() }
+	if ic.live != nil {
+		return ic.h.manager.WithLock(ic.ctx, ic.live.SessionID, run)
+	}
+	return run()
+}
+
+func (ic *interceptor) processLocked() error {
+	hdr := ic.ResponseWriter.Header()
+
+	// (5) Owner binding from the backend's identity header, then strip it.
+	if raw := hdr.Get(ic.h.IdentityHeader); raw != "" {
+		hdr.Del(ic.h.IdentityHeader)
+		ownerID, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil {
+			if err := ic.ensureLive(); err != nil {
+				return err
+			}
+			if _, err := ic.live.BindOwner(ic.ctx, ownerID); err != nil {
+				return err
+			}
+		}
+	}
+
+	// (6) Filter each Set-Cookie: forward / store / drop.
+	setCookies := hdr.Values("Set-Cookie")
+	hdr.Del("Set-Cookie")
+	for _, sc := range setCookies {
+		name, value := parseSetCookie(sc)
+		switch ic.h.filter.Decide(name) {
+		case filter.Forward:
+			hdr.Add("Set-Cookie", sc) // reaches the client unchanged
+		case filter.Store:
+			if err := ic.ensureLive(); err != nil {
+				return err
+			}
+			if err := ic.live.StoreCookie(ic.ctx, name, value); err != nil {
+				return err
+			}
+		case filter.Drop:
+			// omit entirely
+		}
+	}
+
+	// (7) Emit/refresh the proxy cookie if the session is new or rotated.
+	if ic.live != nil {
+		if val, changed := ic.live.NewProxyCookie(); changed {
+			hdr.Add("Set-Cookie", ic.h.buildProxyCookie(val))
+		}
+	}
+	return nil
+}
+
+// ensureLive lazily creates a session the first time a store/bind is needed.
+func (ic *interceptor) ensureLive() error {
+	if ic.live != nil {
+		return nil
+	}
+	l, err := ic.h.manager.Begin(ic.ctx)
+	if err != nil {
+		return err
+	}
+	ic.live = l
+	return nil
+}
+
+func (h *Handler) buildProxyCookie(value string) string {
+	c := &http.Cookie{
+		Name:     h.Cookie.Name,
+		Value:    value,
+		HttpOnly: true,
+		Secure:   !h.Cookie.Insecure,
+	}
+	if h.Cookie.Path != "" { // no default Path
+		c.Path = h.Cookie.Path
+	}
+	switch strings.ToLower(h.Cookie.SameSite) {
+	case "strict":
+		c.SameSite = http.SameSiteStrictMode
+	case "none":
+		c.SameSite = http.SameSiteNoneMode
+	default:
+		c.SameSite = http.SameSiteLaxMode
+	}
+	return c.String()
+}
+
+// parseSetCookie extracts the name and value from a Set-Cookie header value.
+func parseSetCookie(sc string) (name, value string) {
+	first := sc
+	if i := strings.IndexByte(sc, ';'); i >= 0 {
+		first = sc[:i]
+	}
+	if eq := strings.IndexByte(first, '='); eq >= 0 {
+		return strings.TrimSpace(first[:eq]), strings.TrimSpace(first[eq+1:])
+	}
+	return strings.TrimSpace(first), ""
+}
+
+// hashID returns a short, non-reversible tag for logging ids safely.
+func hashID(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:6])
 }
