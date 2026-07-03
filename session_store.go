@@ -249,6 +249,11 @@ func (h *Handler) Validate() error {
 	if h.OnStoreError != "fail_closed" && h.OnStoreError != "fail_open" {
 		return fmt.Errorf("session_store: on_store_error must be fail_closed or fail_open")
 	}
+	// SameSite=None requires Secure; browsers reject a None cookie without it,
+	// and accepting it would remove the CSRF protection Lax/Strict provide.
+	if strings.EqualFold(h.Cookie.SameSite, "none") && h.Cookie.Insecure {
+		return fmt.Errorf("session_store: cookie same_site none requires a secure cookie (remove insecure)")
+	}
 	return nil
 }
 
