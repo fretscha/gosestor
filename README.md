@@ -9,6 +9,19 @@ the client.
 
     xcaddy build --with gosestor=.
 
+## Demo
+
+A ready-to-run Docker demo (Caddy+gosestor built via `xcaddy`, Redis, and a stub
+backend) lives in [`demo/`](demo/):
+
+    cd demo
+    docker compose up --build      # proxy on http://localhost:8080
+    ./demo.sh                       # curl walkthrough
+
+It shows cookie swallowing/re-injection, `forward`/drop filtering, and that a
+client cannot spoof the identity header or smuggle managed cookies to the
+backend. See [`demo/README.md`](demo/README.md).
+
 ## Example Caddyfile
 
     example.com {
