@@ -74,7 +74,10 @@ func (m *Manager) Begin(ctx context.Context) (*Live, error) {
 		InactiveTimeout: int64(m.cfg.Inactive.Seconds()),
 		FinalTimeout:    int64(m.cfg.Final.Seconds()),
 	}
-	ttl := m.cfg.Inactive
+	// TTL must respect min(inactive, remaining-until-final) so the store never
+	// outlives the absolute deadline; at creation (Creation==now) this equals
+	// min(Inactive, Final).
+	ttl := m.ttl(sess, now)
 	if err := m.store.PutSession(ctx, sess, ttl); err != nil {
 		return nil, err
 	}
@@ -225,12 +228,15 @@ func (m *Manager) RevokeOwner(ctx context.Context, ownerID int64) error {
 	if err != nil {
 		return err
 	}
+	// Attempt every deletion — logout-everywhere must not leave sessions alive
+	// on a transient error — and return the first error seen.
+	var firstErr error
 	for _, sid := range sids {
-		if err := m.store.DeleteSession(ctx, sid); err != nil {
-			return err
+		if err := m.store.DeleteSession(ctx, sid); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // WithLock serializes same-session work when Synchronize is enabled. When it
