@@ -109,7 +109,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						if !d.NextArg() {
 							return d.ArgErr()
 						}
-						fmt.Sscanf(d.Val(), "%d", &h.Redis.DB)
+						if _, err := fmt.Sscanf(d.Val(), "%d", &h.Redis.DB); err != nil {
+							return d.Errf("invalid db %q: %v", d.Val(), err)
+						}
 					case "key_prefix":
 						if !d.NextArg() {
 							return d.ArgErr()
@@ -269,9 +271,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if c, err := r.Cookie(h.Cookie.Name); err == nil {
 		l, err := h.manager.Resolve(ctx, c.Value)
 		if err != nil {
-			return h.storeError(w, "resolve", err)
+			h.logger.Error("session store error", zap.String("op", "resolve"), zap.Error(err))
+			if h.OnStoreError == "fail_closed" {
+				w.WriteHeader(http.StatusBadGateway)
+				return nil
+			}
+			// fail_open: proceed without a session (live stays nil)
+		} else {
+			live = l
 		}
-		live = l
 	}
 	if live != nil {
 		injectCookies(r, live.Cookies)
@@ -317,15 +325,6 @@ func injectCookies(r *http.Request, cached map[string]string) {
 	r.Header.Set("Cookie", b.String())
 }
 
-func (h *Handler) storeError(w http.ResponseWriter, op string, err error) error {
-	h.logger.Error("session store error", zap.String("op", op), zap.Error(err))
-	if h.OnStoreError == "fail_open" {
-		return nil
-	}
-	w.WriteHeader(http.StatusBadGateway)
-	return nil
-}
-
 // interceptor rewrites response headers (Set-Cookie, identity) exactly once,
 // just before the first Write/WriteHeader.
 type interceptor struct {
@@ -359,9 +358,15 @@ func (ic *interceptor) Write(b []byte) (int, error) {
 func (ic *interceptor) ensureProcessed() {
 	ic.once.Do(func() {
 		if err := ic.process(); err != nil {
-			ic.h.logger.Error("session store error",
-				zap.String("op", "response"), zap.Error(err))
+			fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
+			if ic.live != nil {
+				fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
+			}
+			ic.h.logger.Error("session store error", fields...)
 			if ic.h.OnStoreError == "fail_closed" {
+				h := ic.ResponseWriter.Header()
+				h.Del("Set-Cookie")
+				h.Del(ic.h.IdentityHeader)
 				ic.failed = true
 				ic.storeErr = err
 			}
@@ -381,6 +386,11 @@ func (ic *interceptor) process() error {
 func (ic *interceptor) processLocked() error {
 	hdr := ic.ResponseWriter.Header()
 
+	// Capture and remove ALL backend Set-Cookie first, so no secret cookie can
+	// survive an early return during owner binding or storage.
+	setCookies := hdr.Values("Set-Cookie")
+	hdr.Del("Set-Cookie")
+
 	// (5) Owner binding from the backend's identity header, then strip it.
 	if raw := hdr.Get(ic.h.IdentityHeader); raw != "" {
 		hdr.Del(ic.h.IdentityHeader)
@@ -395,9 +405,7 @@ func (ic *interceptor) processLocked() error {
 		}
 	}
 
-	// (6) Filter each Set-Cookie: forward / store / drop.
-	setCookies := hdr.Values("Set-Cookie")
-	hdr.Del("Set-Cookie")
+	// (6) Filter each captured Set-Cookie: forward / store / drop.
 	for _, sc := range setCookies {
 		name, value := parseSetCookie(sc)
 		switch ic.h.filter.Decide(name) {

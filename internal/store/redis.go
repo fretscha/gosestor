@@ -20,12 +20,12 @@ func NewRedis(client redis.UniversalClient, prefix string) *Redis {
 	return &Redis{c: client, prefix: prefix}
 }
 
-func (r *Redis) sessKey(id string) string   { return r.prefix + "sess:" + id }
-func (r *Redis) attrKey(id string) string   { return r.prefix + "sess:" + id + ":attr" }
-func (r *Redis) shaKey(id string) string    { return r.prefix + "sess:" + id + ":sha" }
-func (r *Redis) keyKey(k string) string     { return r.prefix + "key:" + k }
-func (r *Redis) ownerKey(o int64) string    { return r.prefix + "owner:" + strconv.FormatInt(o, 10) }
-func (r *Redis) lockKey(id string) string   { return r.prefix + "lock:" + id }
+func (r *Redis) sessKey(id string) string { return r.prefix + "sess:" + id }
+func (r *Redis) attrKey(id string) string { return r.prefix + "sess:" + id + ":attr" }
+func (r *Redis) shaKey(id string) string  { return r.prefix + "sess:" + id + ":sha" }
+func (r *Redis) keyKey(k string) string   { return r.prefix + "key:" + k }
+func (r *Redis) ownerKey(o int64) string  { return r.prefix + "owner:" + strconv.FormatInt(o, 10) }
+func (r *Redis) lockKey(id string) string { return r.prefix + "lock:" + id }
 
 func (r *Redis) PutSession(ctx context.Context, s Session, ttl time.Duration) error {
 	pipe := r.c.TxPipeline()

@@ -18,6 +18,9 @@ func stubBackend(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Report the Cookie header the backend received (for re-injection test).
 		w.Header().Set("X-Seen-Cookie", r.Header.Get("Cookie"))
+		// Echo the request's identity header into a differently-named response
+		// header so the anti-spoof test can verify it was stripped before arrival.
+		w.Header().Set("X-Seen-Auth", r.Header.Get("X-Auth-User"))
 		if r.URL.Path == "/login" {
 			w.Header().Set("Set-Cookie", "JSESSIONID=secret-sess; Path=/")
 			w.Header().Set("X-Auth-User", "42")
@@ -34,7 +37,7 @@ func stubBackend(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func harness(t *testing.T) (*caddytest.Tester, *httptest.Server) {
+func harness(t *testing.T) (*caddytest.Tester, *httptest.Server, *miniredis.Miniredis) {
 	mr, err := miniredis.Run()
 	if err != nil {
 		t.Fatal(err)
@@ -66,11 +69,11 @@ func harness(t *testing.T) (*caddytest.Tester, *httptest.Server) {
 		reverse_proxy %s
 	}`, mr.Addr(), strings.TrimPrefix(backend.URL, "http://"))
 	tester.InitServer(config, "caddyfile")
-	return tester, backend
+	return tester, backend, mr
 }
 
 func TestStoredCookieHiddenAndReinjected(t *testing.T) {
-	tester, _ := harness(t)
+	tester, _, _ := harness(t)
 
 	// Login: backend sets JSESSIONID (stored) + X-Auth-User (stripped).
 	resp, _ := tester.AssertGetResponse("http://localhost:9080/login", 200, "ok\n")
@@ -103,7 +106,7 @@ func TestStoredCookieHiddenAndReinjected(t *testing.T) {
 }
 
 func TestForwardAndDrop(t *testing.T) {
-	tester, _ := harness(t)
+	tester, _, _ := harness(t)
 
 	fwd, _ := tester.AssertGetResponse("http://localhost:9080/csrf", 200, "ok\n")
 	if !cookiePresent(fwd, "XSRF-TOKEN") {
@@ -117,20 +120,45 @@ func TestForwardAndDrop(t *testing.T) {
 }
 
 func TestClientSuppliedIdentityHeaderStripped(t *testing.T) {
-	tester, backend := harness(t)
-	_ = backend
+	tester, _, _ := harness(t)
 	req, _ := http.NewRequest("GET", "http://localhost:9080/", nil)
 	req.Header.Set("X-Auth-User", "999") // forged
 	r, err := tester.Client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Backend echoes the Cookie header only; a forged identity must never bind
-	// an owner. The proxy cookie (if any) must not be tied to owner 999 — we
-	// assert indirectly: no Set-Cookie for a new owner-bound session on a plain
-	// GET with no backend identity output.
-	if cookiePresent(r, "__gosestor") {
-		t.Fatal("plain GET must not create an owner-bound session from a forged header")
+	// The backend echoes whatever X-Auth-User it received into X-Seen-Auth.
+	// If gosestor stripped the forged header before proxying, the backend never
+	// saw it and X-Seen-Auth must be empty.
+	if got := r.Header.Get("X-Seen-Auth"); got != "" {
+		t.Fatalf("forged X-Auth-User reached the backend: X-Seen-Auth=%q", got)
+	}
+}
+
+func TestFailClosedStoreDownReturns502(t *testing.T) {
+	tester, _, mr := harness(t)
+
+	// Warm up: ensure Caddy is fully ready by completing one successful request.
+	tester.AssertGetResponse("http://localhost:9080/", 200, "ok\n")
+
+	// Bring Redis down so the next store operation fails.
+	mr.Close()
+
+	// GET /login: backend will emit Set-Cookie: JSESSIONID + X-Auth-User.
+	// With Redis down and fail_closed, gosestor must return 502 and must NOT
+	// leak the JSESSIONID cookie to the client.
+	req, _ := http.NewRequest("GET", "http://localhost:9080/login", nil)
+	resp, err := tester.Client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d", resp.StatusCode)
+	}
+	for _, sc := range resp.Header["Set-Cookie"] {
+		if strings.Contains(sc, "JSESSIONID") {
+			t.Fatalf("JSESSIONID leaked in Set-Cookie with store down: %q", sc)
+		}
 	}
 }
 
