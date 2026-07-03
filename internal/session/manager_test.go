@@ -162,6 +162,30 @@ func TestBindOwnerRotatesOnTransition(t *testing.T) {
 	}
 }
 
+// TestBindOwnerInvalidatesOldKey is the session-fixation regression guard: a
+// KEY_ID known before authentication must not resolve after the OWNER_ID
+// transition rotates it away, even immediately (no grace revival).
+func TestBindOwnerInvalidatesOldKey(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	oldKey := live.KeyID
+
+	if _, err := live.BindOwner(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	// The pre-auth key must be dead immediately.
+	if got, err := m.Resolve(ctx, oldKey); err != nil || got != nil {
+		t.Fatalf("fixated pre-auth key still resolves after rotation: got=%+v err=%v", got, err)
+	}
+	// And it must stay dead on a later attempt (no TTL revival path).
+	clk.advance(time.Second)
+	if got, _ := m.Resolve(ctx, oldKey); got != nil {
+		t.Fatal("old key resurfaced on a subsequent request")
+	}
+}
+
 func TestRevokeOwnerKillsAllSessions(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	m, st := newTestManager(clk)

@@ -212,7 +212,13 @@ func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
 	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
 		return false, err
 	}
-	if err := l.m.store.SetKeyTTL(ctx, l.KeyID, l.m.cfg.Grace); err != nil {
+	// Hard-delete the old KEY_ID rather than grace it. A graced key still maps
+	// to the now-authenticated session, and Resolve slides any live key's TTL
+	// back to the full inactive window on use — so a graced key defeats the
+	// fixation defense: an attacker who fixated a pre-auth KEY_ID could use it
+	// after login (within grace) to gain authenticated access and renew it
+	// indefinitely. Deleting it closes that window entirely.
+	if err := l.m.store.DeleteKey(ctx, l.KeyID); err != nil {
 		return false, err
 	}
 	l.OwnerID = ownerID

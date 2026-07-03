@@ -273,17 +273,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if err != nil {
 			h.logger.Error("session store error", zap.String("op", "resolve"), zap.Error(err))
 			if h.OnStoreError == "fail_closed" {
-				w.WriteHeader(http.StatusBadGateway)
-				return nil
+				return caddyhttp.Error(http.StatusBadGateway, err)
 			}
 			// fail_open: proceed without a session (live stays nil)
 		} else {
 			live = l
 		}
 	}
+	// Always rewrite the upstream Cookie header: strip the opaque proxy key and
+	// any client-supplied store-managed cookie names (the server's cached values
+	// are authoritative), then inject the cached values. Runs even without a
+	// live session so a client cannot smuggle managed cookies to the backend.
+	var cached map[string]string
 	if live != nil {
-		injectCookies(r, live.Cookies)
+		cached = live.Cookies
 	}
+	h.prepareUpstreamCookies(r, cached)
 
 	// Response interception: process Set-Cookie + identity header before flush.
 	ic := &interceptor{ResponseWriter: w, h: h, r: r, live: live, ctx: ctx}
@@ -294,52 +299,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// If body was never written (e.g. 0-length), ensure headers are processed.
 	ic.ensureProcessed()
 	if ic.storeErr != nil {
-		return ic.storeErr
+		if ic.wroteHeader {
+			return nil // 502 already committed to the client by WriteHeader
+		}
+		return caddyhttp.Error(http.StatusBadGateway, ic.storeErr)
 	}
 	return nil
 }
 
-// injectCookies merges cached cookies into the outbound Cookie header so the
-// backend sees its own cookies as if the client had sent them.
-func injectCookies(r *http.Request, cached map[string]string) {
-	if len(cached) == 0 {
+// prepareUpstreamCookies rewrites the inbound Cookie header the backend will
+// see. It removes (a) the opaque proxy cookie — the KEY_ID must never cross the
+// proxy boundary — and (b) any client-supplied cookie whose name the plugin
+// stores, since the server-held value is authoritative and a client must not be
+// able to smuggle or override a managed cookie to the backend. It then injects
+// the cached (server-held) values so the backend sees its own session cookies.
+func (h *Handler) prepareUpstreamCookies(r *http.Request, cached map[string]string) {
+	var kept []string
+	for _, c := range r.Cookies() {
+		if c.Name == h.Cookie.Name {
+			continue // never forward the proxy KEY_ID upstream
+		}
+		if h.filter.Decide(c.Name) == filter.Store {
+			continue // stored cookies are server-authoritative; drop client copies
+		}
+		kept = append(kept, c.Name+"="+c.Value)
+	}
+	for name, val := range cached {
+		kept = append(kept, name+"="+val)
+	}
+	if len(kept) == 0 {
+		r.Header.Del("Cookie")
 		return
 	}
-	existing := map[string]bool{}
-	for _, c := range r.Cookies() {
-		existing[c.Name] = true
-	}
-	var b strings.Builder
-	b.WriteString(r.Header.Get("Cookie"))
-	for name, val := range cached {
-		if existing[name] {
-			continue
-		}
-		if b.Len() > 0 {
-			b.WriteString("; ")
-		}
-		b.WriteString(name)
-		b.WriteString("=")
-		b.WriteString(val)
-	}
-	r.Header.Set("Cookie", b.String())
+	r.Header.Set("Cookie", strings.Join(kept, "; "))
 }
 
 // interceptor rewrites response headers (Set-Cookie, identity) exactly once,
 // just before the first Write/WriteHeader.
 type interceptor struct {
 	http.ResponseWriter
-	h        *Handler
-	r        *http.Request
-	live     *session.Live
-	ctx      context.Context
-	once     sync.Once
-	failed   bool
-	storeErr error
+	h           *Handler
+	r           *http.Request
+	live        *session.Live
+	ctx         context.Context
+	once        sync.Once
+	failed      bool
+	wroteHeader bool
+	storeErr    error
 }
 
 func (ic *interceptor) WriteHeader(status int) {
 	ic.ensureProcessed()
+	ic.wroteHeader = true
 	if ic.failed {
 		ic.ResponseWriter.WriteHeader(http.StatusBadGateway)
 		return
@@ -357,19 +368,26 @@ func (ic *interceptor) Write(b []byte) (int, error) {
 
 func (ic *interceptor) ensureProcessed() {
 	ic.once.Do(func() {
-		if err := ic.process(); err != nil {
-			fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
-			if ic.live != nil {
-				fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
-			}
-			ic.h.logger.Error("session store error", fields...)
-			if ic.h.OnStoreError == "fail_closed" {
-				h := ic.ResponseWriter.Header()
-				h.Del("Set-Cookie")
-				h.Del(ic.h.IdentityHeader)
-				ic.failed = true
-				ic.storeErr = err
-			}
+		err := ic.process()
+		if err == nil {
+			return
+		}
+		// On ANY response-path failure — including a contended lock that skips
+		// processLocked entirely — never leak backend secrets: drop every
+		// Set-Cookie and the identity header regardless of on_store_error. Under
+		// fail_open the request still completes (no 502), just without a managed
+		// session; under fail_closed we additionally serve 502.
+		h := ic.ResponseWriter.Header()
+		h.Del("Set-Cookie")
+		h.Del(ic.h.IdentityHeader)
+		fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
+		if ic.live != nil {
+			fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
+		}
+		ic.h.logger.Error("session store error", fields...)
+		if ic.h.OnStoreError == "fail_closed" {
+			ic.failed = true
+			ic.storeErr = err
 		}
 	})
 }
@@ -391,9 +409,12 @@ func (ic *interceptor) processLocked() error {
 	setCookies := hdr.Values("Set-Cookie")
 	hdr.Del("Set-Cookie")
 
-	// (5) Owner binding from the backend's identity header, then strip it.
-	if raw := hdr.Get(ic.h.IdentityHeader); raw != "" {
-		hdr.Del(ic.h.IdentityHeader)
+	// (5) Owner binding from the backend's identity header, then strip it. The
+	// header is deleted unconditionally (even when empty) so it never reaches
+	// the client.
+	raw := hdr.Get(ic.h.IdentityHeader)
+	hdr.Del(ic.h.IdentityHeader)
+	if raw != "" {
 		ownerID, err := strconv.ParseInt(raw, 10, 64)
 		if err == nil {
 			if err := ic.ensureLive(); err != nil {
