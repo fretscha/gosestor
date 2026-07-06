@@ -5,6 +5,9 @@ Redis-compatible store and hands the client a single opaque, rotatable proxy
 cookie. Backend session cookies remain server-side and are never exposed to
 the client.
 
+For the architecture, request lifecycle, Redis layout, and the reasoning behind
+the security decisions, see the [code walkthrough](docs/code-walkthrough.md).
+
 ## Build
 
     xcaddy build --with gosestor=.
