@@ -35,6 +35,7 @@ func (r *Redis) PutSession(ctx context.Context, s Session, ttl time.Duration) er
 		"inactive_timeout": s.InactiveTimeout,
 		"final_timeout":    s.FinalTimeout,
 		"owner_id":         s.OwnerID,
+		"last_rotation":    s.LastRotation,
 	})
 	if ttl > 0 {
 		pipe.Expire(ctx, r.sessKey(s.ID), ttl)
@@ -59,17 +60,31 @@ func (r *Redis) GetSession(ctx context.Context, id string) (Session, error) {
 		InactiveTimeout: atoi("inactive_timeout"),
 		FinalTimeout:    atoi("final_timeout"),
 		OwnerID:         atoi("owner_id"),
+		LastRotation:    atoi("last_rotation"),
 	}, nil
 }
 
 func (r *Redis) DeleteSession(ctx context.Context, id string) error {
-	keyIDs, _ := r.c.SMembers(ctx, r.sessKey(id)+":keys").Result()
+	keyIDs, err := r.c.SMembers(ctx, r.sessKey(id)+":keys").Result()
+	if err != nil {
+		return err
+	}
+	// Read the owner before the hash is gone so we can prune the owner index;
+	// owner_id 0 is anonymous and has no index entry. A missing hash (already
+	// expired) is fine — a real read failure must not silently skip the prune.
+	ownerID, err := r.c.HGet(ctx, r.sessKey(id), "owner_id").Int64()
+	if err != nil && err != redis.Nil {
+		return err
+	}
 	pipe := r.c.TxPipeline()
 	for _, k := range keyIDs {
 		pipe.Del(ctx, r.keyKey(k))
 	}
 	pipe.Del(ctx, r.sessKey(id), r.attrKey(id), r.shaKey(id), r.sessKey(id)+":keys")
-	_, err := pipe.Exec(ctx)
+	if ownerID != 0 {
+		pipe.SRem(ctx, r.ownerKey(ownerID), id)
+	}
+	_, err = pipe.Exec(ctx)
 	return err
 }
 
@@ -94,7 +109,19 @@ func (r *Redis) SetKeyTTL(ctx context.Context, keyID string, ttl time.Duration) 
 }
 
 func (r *Redis) DeleteKey(ctx context.Context, keyID string) error {
-	return r.c.Del(ctx, r.keyKey(keyID)).Err()
+	// Look up the owning session so we can also drop this key from its reverse
+	// set; leaving it there lets the set grow unbounded across key rotations.
+	sid, err := r.c.Get(ctx, r.keyKey(keyID)).Result()
+	if err != nil && err != redis.Nil {
+		return err
+	}
+	pipe := r.c.TxPipeline()
+	pipe.Del(ctx, r.keyKey(keyID))
+	if err == nil { // key existed; prune its reverse-set membership
+		pipe.SRem(ctx, r.sessKey(sid)+":keys", keyID)
+	}
+	_, err = pipe.Exec(ctx)
+	return err
 }
 
 func (r *Redis) GetCookies(ctx context.Context, sessionID string) (map[string]string, error) {
@@ -113,8 +140,20 @@ func (r *Redis) PutCookie(ctx context.Context, sessionID, name, value, sha strin
 	return err
 }
 
-func (r *Redis) AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error {
-	return r.c.SAdd(ctx, r.ownerKey(ownerID), sessionID).Err()
+func (r *Redis) AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string, ttl time.Duration) error {
+	pipe := r.c.TxPipeline()
+	pipe.SAdd(ctx, r.ownerKey(ownerID), sessionID)
+	if ttl > 0 {
+		// Slide the whole set's TTL on each login so an abandoned owner set
+		// (all member sessions TTL-expired) eventually disappears itself.
+		pipe.Expire(ctx, r.ownerKey(ownerID), ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (r *Redis) RemoveOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error {
+	return r.c.SRem(ctx, r.ownerKey(ownerID), sessionID).Err()
 }
 
 func (r *Redis) OwnerSessions(ctx context.Context, ownerID int64) ([]string, error) {
@@ -152,5 +191,3 @@ func (r *Redis) Lock(ctx context.Context, sessionID string, ttl time.Duration) (
 	}
 	return unlock, true, nil
 }
-
-func (r *Redis) Ping(ctx context.Context) error { return r.c.Ping(ctx).Err() }

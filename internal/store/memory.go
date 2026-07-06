@@ -49,6 +49,11 @@ func (m *Memory) GetSession(_ context.Context, id string) (Session, error) {
 func (m *Memory) DeleteSession(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s, ok := m.sessions[id]; ok && s.OwnerID != 0 {
+		if set := m.owners[s.OwnerID]; set != nil {
+			delete(set, id)
+		}
+	}
 	delete(m.sessions, id)
 	delete(m.cookies, id)
 	delete(m.shas, id)
@@ -110,13 +115,22 @@ func (m *Memory) PutCookie(_ context.Context, sessionID, name, value, sha string
 	return nil
 }
 
-func (m *Memory) AddOwnerIndex(_ context.Context, ownerID int64, sessionID string) error {
+func (m *Memory) AddOwnerIndex(_ context.Context, ownerID int64, sessionID string, _ time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.owners[ownerID] == nil {
 		m.owners[ownerID] = map[string]struct{}{}
 	}
 	m.owners[ownerID][sessionID] = struct{}{}
+	return nil
+}
+
+func (m *Memory) RemoveOwnerIndex(_ context.Context, ownerID int64, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if set := m.owners[ownerID]; set != nil {
+		delete(set, sessionID)
+	}
 	return nil
 }
 
@@ -147,8 +161,6 @@ func (m *Memory) Lock(_ context.Context, sessionID string, _ time.Duration) (fun
 	}
 	return unlock, true, nil
 }
-
-func (m *Memory) Ping(context.Context) error { return nil }
 
 func copyMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))

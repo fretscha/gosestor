@@ -18,6 +18,7 @@ type Session struct {
 	InactiveTimeout int64
 	FinalTimeout    int64
 	OwnerID         int64
+	LastRotation    int64 // Unix seconds of the last KEY_ID rotation (for rotate_interval)
 }
 
 // Store is the persistence contract. Implementations: in-memory (tests) and
@@ -40,8 +41,11 @@ type Store interface {
 	CookieSHAs(ctx context.Context, sessionID string) (shas map[string]string, err error)
 	PutCookie(ctx context.Context, sessionID, name, value, sha string) error
 
-	// owner index.
-	AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error
+	// owner index. ttl bounds the whole owner set: it slides on every add, so a
+	// set that stops receiving logins expires instead of growing forever on
+	// TTL-expired sessions that never pass through DeleteSession.
+	AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string, ttl time.Duration) error
+	RemoveOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error
 	OwnerSessions(ctx context.Context, ownerID int64) ([]string, error)
 
 	// Refresh slides the TTL on the session + its attribute keys.
@@ -50,7 +54,4 @@ type Store interface {
 	// Lock takes a per-session advisory lock; returns (unlock, acquired, err).
 	// unlock is nil when acquired is false.
 	Lock(ctx context.Context, sessionID string, ttl time.Duration) (unlock func(context.Context) error, acquired bool, err error)
-
-	// Ping checks connectivity (used by fail_closed provisioning).
-	Ping(ctx context.Context) error
 }

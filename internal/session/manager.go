@@ -17,6 +17,14 @@ type Config struct {
 	Inactive    time.Duration
 	Final       time.Duration
 	Synchronize bool
+	// RotateOnLogin rotates the KEY_ID on an OWNER_ID transition (fixation
+	// defense). Callers must set it explicitly; the handler defaults it to true.
+	RotateOnLogin bool
+	// RotateInterval, when > 0, rotates a session's KEY_ID on the first request
+	// after this much time has elapsed since the last rotation. Zero disables it.
+	// The rotation is decided in Resolve but executed by MaybeRotate on the
+	// response path, so a failed request can never strand the client's key.
+	RotateInterval time.Duration
 }
 
 // Manager owns session/key lifecycle over a Store.
@@ -41,10 +49,11 @@ type Live struct {
 	OwnerID   int64
 	Cookies   map[string]string
 
-	m       *Manager
-	shas    map[string]string
-	newKey  string // set when a proxy cookie must be (re)written
-	rewrite bool
+	m         *Manager
+	shas      map[string]string
+	newKey    string // set when a proxy cookie must be (re)written
+	rewrite   bool
+	rotateDue bool // interval rotation decided in Resolve, executed in MaybeRotate
 }
 
 func (m *Manager) newID() (string, error) {
@@ -72,6 +81,7 @@ func (m *Manager) Begin(ctx context.Context) (*Live, error) {
 		LastAccess:      now,
 		InactiveTimeout: int64(m.cfg.Inactive.Seconds()),
 		FinalTimeout:    int64(m.cfg.Final.Seconds()),
+		LastRotation:    now,
 	}
 	// TTL must respect min(inactive, remaining-until-final) so the store never
 	// outlives the absolute deadline; at creation (Creation==now) this equals
@@ -111,6 +121,21 @@ func (m *Manager) Resolve(ctx context.Context, keyID string) (*Live, error) {
 		_ = m.store.DeleteSession(ctx, sid)
 		return nil, nil
 	}
+	// Decide whether this request crosses a periodic-rotation boundary. The key
+	// swap itself is deferred to MaybeRotate on the response path: destroying
+	// the old KEY_ID here, before the replacement cookie is guaranteed to reach
+	// the client, would strand the session on any upstream/response failure.
+	rotateDue := false
+	if m.cfg.RotateInterval > 0 {
+		if sess.LastRotation == 0 {
+			// Pre-rotation session (created before rotate_interval existed):
+			// start its clock now instead of mass-rotating every legacy session
+			// on its first post-upgrade request.
+			sess.LastRotation = now
+		} else {
+			rotateDue = now-sess.LastRotation >= int64(m.cfg.RotateInterval.Seconds())
+		}
+	}
 	// Slide the window: update last_access and refresh TTLs.
 	sess.LastAccess = now
 	ttl := m.ttl(sess, now)
@@ -133,8 +158,39 @@ func (m *Manager) Resolve(ctx context.Context, keyID string) (*Live, error) {
 	}
 	return &Live{
 		KeyID: keyID, SessionID: sid, OwnerID: sess.OwnerID,
-		Cookies: cookies, shas: shas, m: m,
+		Cookies: cookies, shas: shas, m: m, rotateDue: rotateDue,
 	}, nil
+}
+
+// MaybeRotate executes an interval rotation decided during Resolve. It must run
+// on the response path — after the upstream completed, under the per-session
+// lock when synchronize_sessions is on — so the old KEY_ID is only hard-deleted
+// once its replacement cookie cannot miss the response. It re-reads the session
+// so a concurrent request that already rotated is detected and skipped.
+func (l *Live) MaybeRotate(ctx context.Context) error {
+	if !l.rotateDue || l.rewrite {
+		// Not due, or this request already carries a fresh key (Begin or a
+		// login rotation) — a second swap would churn keys for nothing.
+		return nil
+	}
+	now := l.m.clock.Now().Unix()
+	sess, err := l.m.store.GetSession(ctx, l.SessionID)
+	if err != nil {
+		return err
+	}
+	if now-sess.LastRotation < int64(l.m.cfg.RotateInterval.Seconds()) {
+		return nil // a concurrent request rotated meanwhile
+	}
+	sess.LastRotation = now
+	ttl := l.m.ttl(sess, now)
+	// LastRotation is persisted BEFORE the key swap: if the swap fails, the
+	// client keeps its still-valid old key and rotation retries next interval.
+	// The reverse order could delete the old key and then fail before the new
+	// cookie is emitted, stranding the client.
+	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
+		return err
+	}
+	return l.rotateKey(ctx, ttl)
 }
 
 // expired reports whether the session is past its inactive or final limit.
@@ -184,9 +240,12 @@ func (l *Live) StoreCookie(ctx context.Context, name, value string) error {
 }
 
 // BindOwner sets OWNER_ID when it changes and rotates the KEY_ID on that
-// transition (fixation defense). No-op when ownerID equals the current owner.
+// transition (fixation defense, gated by RotateOnLogin). No-op when ownerID
+// equals the current owner or is non-positive: 0 is the anonymous sentinel and
+// negatives are invalid, and neither may ever reach the owner index — the
+// delete-time pruning skips owner 0, so an indexed 0-set could never shrink.
 func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
-	if ownerID == l.OwnerID {
+	if ownerID <= 0 || ownerID == l.OwnerID {
 		return false, nil
 	}
 	now := l.m.clock.Now().Unix()
@@ -196,36 +255,51 @@ func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
 	}
 	sess.OwnerID = ownerID
 	sess.LastAccess = now
+	if l.m.cfg.RotateOnLogin {
+		sess.LastRotation = now // the fixation rotation below also resets the periodic clock
+	}
 	ttl := l.m.ttl(sess, now)
 	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
 		return false, err
 	}
-	if err := l.m.store.AddOwnerIndex(ctx, ownerID, l.SessionID); err != nil {
-		return false, err
-	}
-	// Rotate: mint a new key and hard-delete the old one (session-fixation defense).
-	newKey, err := l.m.newID()
-	if err != nil {
-		return false, err
-	}
-	// PutKey before DeleteKey: on a partial store failure the new key is orphaned but is never issued to the client.
-	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
-		return false, err
-	}
-	// Hard-delete the old KEY_ID rather than grace it. A graced key still maps
-	// to the now-authenticated session, and Resolve slides any live key's TTL
-	// back to the full inactive window on use — so a graced key defeats the
-	// fixation defense: an attacker who fixated a pre-auth KEY_ID could use it
-	// after login (within grace) to gain authenticated access and renew it
-	// indefinitely. Deleting it closes that window entirely.
-	if err := l.m.store.DeleteKey(ctx, l.KeyID); err != nil {
+	if err := l.m.store.AddOwnerIndex(ctx, ownerID, l.SessionID, time.Duration(sess.FinalTimeout)*time.Second); err != nil {
 		return false, err
 	}
 	l.OwnerID = ownerID
+	if !l.m.cfg.RotateOnLogin {
+		return false, nil
+	}
+	// Rotate the KEY_ID on the identity transition (session-fixation defense).
+	if err := l.rotateKey(ctx, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// rotateKey mints a fresh KEY_ID, persists it, and hard-deletes the current one,
+// marking the handle so the new proxy cookie is re-emitted on the response.
+//
+// The old KEY_ID is hard-deleted rather than graced. A graced key still maps to
+// the session, and Resolve slides any live key's TTL back to the full inactive
+// window on use — so a graced key would defeat the fixation defense: an attacker
+// who fixated a pre-auth KEY_ID could use it after login (within grace) to gain
+// authenticated access and renew it indefinitely. Deleting it closes that window.
+func (l *Live) rotateKey(ctx context.Context, ttl time.Duration) error {
+	newKey, err := l.m.newID()
+	if err != nil {
+		return err
+	}
+	// PutKey before DeleteKey: on a partial store failure the new key is orphaned but is never issued to the client.
+	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
+		return err
+	}
+	if err := l.m.store.DeleteKey(ctx, l.KeyID); err != nil {
+		return err
+	}
 	l.KeyID = newKey
 	l.newKey = newKey
 	l.rewrite = true
-	return true, nil
+	return nil
 }
 
 // RevokeOwner deletes every session bound to an owner (logout-everywhere).
@@ -238,7 +312,16 @@ func (m *Manager) RevokeOwner(ctx context.Context, ownerID int64) error {
 	// on a transient error — and return the first error seen.
 	var firstErr error
 	for _, sid := range sids {
-		if err := m.store.DeleteSession(ctx, sid); err != nil && firstErr == nil {
+		if err := m.store.DeleteSession(ctx, sid); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue // keep the index entry so a retried revoke sees the sid
+		}
+		// Prune explicitly: DeleteSession can't prune sids whose session already
+		// TTL-expired (no owner_id left to read), so revoke — which knows the
+		// owner — sweeps every member it walked.
+		if err := m.store.RemoveOwnerIndex(ctx, ownerID, sid); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

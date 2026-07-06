@@ -1,10 +1,12 @@
 package gosestor
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,15 +55,19 @@ type Handler struct {
 	InactiveTimeout caddy.Duration `json:"inactive_timeout,omitempty"`
 	FinalTimeout    caddy.Duration `json:"final_timeout,omitempty"`
 	IdentityHeader  string         `json:"identity_header,omitempty"`
-	RotateOnLogin   bool           `json:"rotate_on_login,omitempty"`
-	RotateInterval  caddy.Duration `json:"rotate_interval,omitempty"`
-	Synchronize     bool           `json:"synchronize_sessions,omitempty"`
-	OnStoreError    string         `json:"on_store_error,omitempty"`
+	// RotateOnLogin is a *bool so a raw-JSON config that omits it fails SAFE:
+	// nil means true (rotate on identity change). A plain bool would zero-value
+	// to false and silently disable the fixation defense for JSON users.
+	RotateOnLogin  *bool          `json:"rotate_on_login,omitempty"`
+	RotateInterval caddy.Duration `json:"rotate_interval,omitempty"`
+	Synchronize    bool           `json:"synchronize_sessions,omitempty"`
+	OnStoreError   string         `json:"on_store_error,omitempty"`
 
-	filter  *filter.Filter
-	manager *session.Manager
-	store   store.Store
-	logger  *zap.Logger
+	filter      *filter.Filter
+	manager     *session.Manager
+	store       store.Store
+	redisClient *redis.Client
+	logger      *zap.Logger
 }
 
 func (Handler) CaddyModule() caddy.ModuleInfo {
@@ -86,7 +92,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	h.IdentityHeader = "X-Auth-User"
 	h.OnStoreError = "fail_closed"
 	h.Redis.KeyPrefix = "gs:"
-	h.RotateOnLogin = true // default: rotate KEY_ID on OWNER_ID transition
+	// RotateOnLogin stays nil unless configured; nil resolves to true in
+	// Provision (rotate KEY_ID on OWNER_ID transition).
 
 	for d.Next() {
 		for d.NextBlock(0) {
@@ -172,15 +179,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.IdentityHeader = d.Val()
 			case "rotate_on_login":
-				// v1 always rotates on an OWNER_ID transition; accepted for
-				// forward-compat. `false` disables identity-change rotation.
+				// `false` disables identity-change rotation (fixation defense);
+				// default is true.
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				h.RotateOnLogin = d.Val() == "true"
+				v, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					return d.Errf("rotate_on_login: invalid boolean %q", d.Val())
+				}
+				h.RotateOnLogin = &v
 			case "rotate_interval":
-				// Deferred groundwork: parsed and stored, not yet wired to
-				// periodic rotation. Zero = off.
+				// Lazily rotates a session's KEY_ID on the first request after this
+				// much time elapses since the last rotation. Zero = off.
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
@@ -193,7 +204,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				h.Synchronize = d.Val() == "true"
+				v, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					// A silent false here would disable the per-session lock the
+					// operator asked for — fail loudly like every other option.
+					return d.Errf("synchronize_sessions: invalid boolean %q", d.Val())
+				}
+				h.Synchronize = v
 			case "on_store_error":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -215,16 +232,34 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.FinalTimeout == 0 {
 		h.FinalTimeout = caddy.Duration(8 * time.Hour)
 	}
-	client := redis.NewClient(&redis.Options{
+	h.redisClient = redis.NewClient(&redis.Options{
 		Addr: h.Redis.Address, Password: h.Redis.Password, DB: h.Redis.DB,
 	})
-	h.store = store.NewRedis(client, h.Redis.KeyPrefix)
+	h.store = store.NewRedis(h.redisClient, h.Redis.KeyPrefix)
 	h.filter = filter.New(h.Forward, h.Store)
 	h.manager = session.NewManager(h.store, session.RealClock{}, session.Config{
-		Inactive:    time.Duration(h.InactiveTimeout),
-		Final:       time.Duration(h.FinalTimeout),
-		Synchronize: h.Synchronize,
+		Inactive:       time.Duration(h.InactiveTimeout),
+		Final:          time.Duration(h.FinalTimeout),
+		Synchronize:    h.Synchronize,
+		RotateOnLogin:  h.RotateOnLogin == nil || *h.RotateOnLogin, // nil = default true (fail safe)
+		RotateInterval: time.Duration(h.RotateInterval),
 	}, nil)
+	// Expose this manager to the admin revoke endpoint (admin.api.gosestor).
+	registerRevoker(h)
+	return nil
+}
+
+// Cleanup deregisters this handler from the admin revoke registry when the
+// config is unloaded — first, so a revoke can never race a closing client —
+// then closes the Redis pool, which would otherwise leak connections and
+// goroutines on every config reload.
+func (h *Handler) Cleanup() error {
+	unregisterRevoker(h)
+	if h.redisClient != nil {
+		if err := h.redisClient.Close(); err != nil {
+			return fmt.Errorf("session_store: closing redis client: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -240,6 +275,11 @@ func (h *Handler) Validate() error {
 	if strings.EqualFold(h.Cookie.SameSite, "none") && h.Cookie.Insecure {
 		return fmt.Errorf("session_store: cookie same_site none requires a secure cookie (remove insecure)")
 	}
+	// Negative durations parse fine but silently disable the feature they
+	// configure — reject them so a typo can't turn off a timeout or rotation.
+	if h.InactiveTimeout < 0 || h.FinalTimeout < 0 || h.RotateInterval < 0 {
+		return fmt.Errorf("session_store: inactive_timeout, final_timeout, and rotate_interval must not be negative")
+	}
 	return nil
 }
 
@@ -247,6 +287,7 @@ func (h *Handler) Validate() error {
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddy.Validator             = (*Handler)(nil)
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
@@ -254,8 +295,13 @@ var (
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ctx := r.Context()
 
-	// (0) Anti-spoof: never trust a client-supplied identity header.
+	// (0) Anti-spoof: never trust a client-supplied identity header. Trailers
+	// too — a trailer-borne copy would bypass the header strip and could reach
+	// a backend that reads trailers.
 	r.Header.Del(h.IdentityHeader)
+	if r.Trailer != nil {
+		r.Trailer.Del(h.IdentityHeader)
+	}
 
 	// (1-4) Resolve any existing session and inject cached cookies upstream.
 	var live *session.Live
@@ -325,6 +371,13 @@ func (h *Handler) prepareUpstreamCookies(r *http.Request, cached map[string]stri
 	r.Header.Set("Cookie", strings.Join(kept, "; "))
 }
 
+// interceptor interface guards: streaming and upgrades must keep working
+// through the wrapper (reverse_proxy probes for these).
+var (
+	_ http.Flusher  = (*interceptor)(nil)
+	_ http.Hijacker = (*interceptor)(nil)
+)
+
 // interceptor rewrites response headers (Set-Cookie, identity) exactly once,
 // just before the first Write/WriteHeader.
 type interceptor struct {
@@ -355,6 +408,35 @@ func (ic *interceptor) Write(b []byte) (int, error) {
 		return len(b), nil // swallow upstream body on fail_closed
 	}
 	return ic.ResponseWriter.Write(b)
+}
+
+// Flush implements http.Flusher so streaming responses (SSE) work through the
+// handler. Headers are processed first — deliberately no Unwrap() is offered,
+// since http.ResponseController reaching the underlying writer directly would
+// commit headers before the fail-safe scrub had a chance to run.
+func (ic *interceptor) Flush() {
+	ic.ensureProcessed()
+	if ic.failed {
+		return // don't stream a body the fail_closed path is swallowing
+	}
+	if f, ok := ic.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack implements http.Hijacker so proxied WebSocket upgrades work. Headers
+// are processed first so managed cookies and the identity header are filtered
+// before the connection leaves HTTP's control.
+func (ic *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	ic.ensureProcessed()
+	if ic.failed {
+		return nil, nil, fmt.Errorf("session_store: refusing hijack after response-path store failure")
+	}
+	hj, ok := ic.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("session_store: underlying ResponseWriter does not support hijacking")
+	}
+	return hj.Hijack()
 }
 
 func (ic *interceptor) ensureProcessed() {
@@ -407,7 +489,9 @@ func (ic *interceptor) processLocked() error {
 	hdr.Del(ic.h.IdentityHeader)
 	if raw != "" {
 		ownerID, err := strconv.ParseInt(raw, 10, 64)
-		if err == nil {
+		// Owner ids are positive integers; 0 is the anonymous sentinel. Guarding
+		// here (BindOwner also refuses) avoids minting a session just to no-op.
+		if err == nil && ownerID > 0 {
 			if err := ic.ensureLive(); err != nil {
 				return err
 			}
@@ -432,6 +516,17 @@ func (ic *interceptor) processLocked() error {
 			}
 		case filter.Drop:
 			// omit entirely
+		}
+	}
+
+	// (6b) Interval rotation, decided in Resolve but executed only here — after
+	// the upstream completed, as the LAST fallible step, under the session lock.
+	// Any earlier failure returns before the old KEY_ID is touched, so the
+	// client's cookie is never invalidated without its replacement being
+	// guaranteed a spot in this response.
+	if ic.live != nil {
+		if err := ic.live.MaybeRotate(ic.ctx); err != nil {
+			return err
 		}
 	}
 
