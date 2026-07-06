@@ -45,12 +45,26 @@ The proxy listens on <http://localhost:8080>. In another terminal:
    nothing: the identity header is stripped before the backend sees it, and the
    forged `JSESSIONID` is removed from the upstream request (the server-held
    value is authoritative).
+6. **Key rotation** — the demo sets `rotate_interval 15s`; after waiting past
+   the interval, the next response carries a **new** `__gosestor` value while
+   the session survives, and the pre-rotation key is hard-deleted (replaying it
+   is an anonymous request). Rotation executes on the response path, so the old
+   key is only destroyed when its replacement is delivered.
+7. **Logout everywhere** — `POST http://localhost:2019/gosestor/revoke/42`
+   (Caddy admin API) kills every session bound to owner 42; the previously
+   authenticated jar goes anonymous. `revoke/0` is rejected with 400 (owner ids
+   must be positive; 0 is the anonymous sentinel).
 
 ## Notes
 
 - The demo runs over plain HTTP, so the proxy cookie is configured `insecure`
   (otherwise the `Secure` attribute would stop it from being sent back over
   HTTP). **In production, serve over HTTPS and drop `insecure`.**
+- The Caddy admin API is published on the **host's loopback only**
+  (`127.0.0.1:2019`) for the revoke demo. Never expose the admin endpoint to
+  other machines — it can mass-logout users and reconfigure Caddy itself.
+- `rotate_interval 15s` is demo-short so you can watch a rotation live; use
+  minutes-to-hours in production.
 - `order session_store before reverse_proxy` in the Caddyfile global options is
   required for any custom handler directive.
 - Tear down with `docker compose down` (add `-v` to also drop the Redis data).

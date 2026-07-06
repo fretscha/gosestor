@@ -1,6 +1,14 @@
 {
 	# Demo runs over plain HTTP on :80 inside the container.
-	admin off
+	#
+	# The admin endpoint is enabled for the logout-everywhere demo (step 7).
+	# docker-compose publishes it ONLY on the host's loopback (127.0.0.1:2019) —
+	# never expose the Caddy admin API publicly. Non-loopback admin listeners
+	# enforce Host checks against the literal listen address, so the host names
+	# curl will use are allowed explicitly here.
+	admin :2019 {
+		origins localhost:2019 127.0.0.1:2019
+	}
 	auto_https off
 	# session_store is a custom handler, so its position in the middleware chain
 	# must be declared explicitly (it runs before the reverse proxy).
@@ -25,6 +33,9 @@
 		identity_header X-Auth-User
 		inactive_timeout 30m
 		final_timeout 8h
+		# Absurdly short so the walkthrough can show a live KEY_ID rotation
+		# (step 6); pick minutes-to-hours in production.
+		rotate_interval 15s
 		on_store_error fail_closed
 	}
 	reverse_proxy backend:8080

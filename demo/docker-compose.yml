@@ -23,4 +23,7 @@ services:
       - backend
     ports:
       - "8080:80"
+      # Caddy admin API (logout-everywhere demo). Bound to the HOST's loopback
+      # only — the admin endpoint must never be reachable from other machines.
+      - "127.0.0.1:2019:2019"
     restart: unless-stopped
