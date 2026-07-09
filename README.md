@@ -7,6 +7,7 @@ the client.
 
 For the architecture, request lifecycle, Redis layout, and the reasoning behind
 the security decisions, see the [code walkthrough](docs/code-walkthrough.md).
+Planned and deferred work is tracked in the [backlog](docs/backlog.md).
 
 ## Build
 
