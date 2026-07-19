@@ -36,6 +36,16 @@
 		# Absurdly short so the walkthrough can show a live KEY_ID rotation
 		# (step 6); pick minutes-to-hours in production.
 		rotate_interval 15s
+		# Path-based authorization: /account needs the default label, /admin
+		# needs adm. No require_default — every other path stays anonymous so
+		# demo steps 1-7 keep working. The auth endpoints are anonymous by
+		# construction (unlisted), which the redirect-loop validation requires.
+		authz {
+			require /account default
+			require /admin   adm
+			auth_endpoint default /login
+			auth_endpoint adm     /mfa
+		}
 		on_store_error fail_closed
 	}
 	reverse_proxy backend:8080

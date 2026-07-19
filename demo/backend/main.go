@@ -26,12 +26,14 @@ func main() {
 		}
 	})
 
-	// Login sets a session cookie (stored server-side) and an identity header
-	// (binds the owner, then stripped). Neither should reach the client.
+	// Login sets a session cookie (stored server-side), an identity header
+	// (binds the owner, then stripped), and grants the `default` label — one
+	// response exercising owner binding + label grant with a single key swap.
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "secret-sess-abc123", Path: "/"})
 		w.Header().Set("X-Auth-User", "42")
-		fmt.Fprintln(w, "backend set JSESSIONID (stored) and X-Auth-User (owner-bound) — both handled server-side.")
+		w.Header().Set("X-Session-Labels", "default")
+		fmt.Fprintln(w, "backend set JSESSIONID (stored), X-Auth-User (owner-bound), and granted label: default.")
 	})
 
 	// CSRF sets a forward-listed cookie: it should reach the client unchanged.
@@ -44,6 +46,31 @@ func main() {
 	mux.HandleFunc("/tracker", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "adtrack", Value: "noisy", Path: "/"})
 		fmt.Fprintln(w, "backend set adtrack — should be dropped (deny-by-default).")
+	})
+
+	// Account requires the `default` label at the proxy; reaching this handler
+	// proves the label was granted and accepted.
+	mux.HandleFunc("/account", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "account area — default label was accepted by the proxy.")
+	})
+
+	// Admin requires the `adm` label at the proxy.
+	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "admin area — adm label was accepted by the proxy.")
+	})
+
+	// MFA step-up: grants adm. Labels REPLACE the whole set, so `default`
+	// must be restated alongside the new privilege.
+	mux.HandleFunc("/mfa", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Session-Labels", "default adm")
+		fmt.Fprintln(w, "backend granted labels: default adm (step-up).")
+	})
+
+	// Step-down: back to default only — adm is revoked by the same REPLACE
+	// mechanism that granted it.
+	mux.HandleFunc("/stepdown", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Session-Labels", "default")
+		fmt.Fprintln(w, "backend granted labels: default (adm revoked).")
 	})
 
 	log.Println("demo backend listening on :8080")
