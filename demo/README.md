@@ -54,6 +54,22 @@ The proxy listens on <http://localhost:8080>. In another terminal:
    (Caddy admin API) kills every session bound to owner 42; the previously
    authenticated jar goes anonymous. `revoke/0` is rejected with 400 (owner ids
    must be positive; 0 is the anonymous sentinel).
+8. **Authorization deny** (`/admin`) — the `authz` block requires the `adm`
+   label for `/admin` and `default` for `/account`. Without a session, a
+   browser (`Accept: text/html`) is 302-redirected to `/mfa?rd=%2Fadmin` —
+   the *adm* endpoint, so deep links land on the right login — while an API
+   client gets a plain 401 with an `X-Auth-Endpoint` hint. Denied requests
+   never reach the backend.
+9. **Default tier** — `/login` now also grants the `default` label via
+   `X-Session-Labels` (stripped, stored in the session). `/account` opens;
+   `/admin` still redirects — being logged in is not the same as holding
+   every label.
+10. **Step-up** — `/mfa` grants `default adm`. A label change is a privilege
+    change, so the proxy cookie rotates automatically; `/admin` then opens
+    with the new cookie.
+11. **Step-down** — `/stepdown` grants only `default`: `adm` is revoked by
+    the same REPLACE mechanism that granted it, the cookie rotates again,
+    and `/admin` closes while `/account` stays open.
 
 ## Notes
 
@@ -67,6 +83,11 @@ The proxy listens on <http://localhost:8080>. In another terminal:
   minutes-to-hours in production.
 - `order session_store before reverse_proxy` in the Caddyfile global options is
   required for any custom handler directive.
+- Labels are granted by the backend (`X-Session-Labels`, stripped from every
+  response) and enforced by the proxy per path prefix; a label-set change
+  rotates the proxy cookie automatically. The demo lists only `/account` and
+  `/admin` — production configs usually add `require_default` to protect
+  everything else too (see the top-level README).
 - Tear down with `docker compose down` (add `-v` to also drop the Redis data).
 
 ## Manual poking

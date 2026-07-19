@@ -85,5 +85,65 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ADMIN/gosestor/revoke/0"
 [ "$CODE" = "400" ] || fail "revoke/0 returned HTTP $CODE, want 400"
 echo "revoke owner 0 -> HTTP $CODE (rejected, as expected)"
 
+hr
+echo "8) AUTHZ DENY — /admin requires the adm label; this client has no session."
+echo "   Expect: browsers get 302 -> /mfa?rd=%2Fadmin; API clients get 401 + X-Auth-Endpoint."
+hr
+HDRS=$(curl -si -H 'Accept: text/html' "$BASE/admin")
+echo "$HDRS" | grep -iE '^HTTP/|^location:' || true
+echo "$HDRS" | grep -qiE '^HTTP/[0-9.]+ 302' || fail "browser deny: expected 302"
+echo "$HDRS" | grep -qi '^location: /mfa?rd=%2Fadmin' || fail "browser deny: wrong Location"
+HDRS=$(curl -si -H 'Accept: application/json' "$BASE/admin")
+echo "$HDRS" | grep -iE '^HTTP/|^x-auth-endpoint:' || true
+echo "$HDRS" | grep -qiE '^HTTP/[0-9.]+ 401' || fail "API deny: expected 401"
+echo "$HDRS" | grep -qi '^x-auth-endpoint: /mfa' || fail "API deny: missing X-Auth-Endpoint"
+echo "anonymous /admin denied both ways — the backend was never reached"
+
+hr
+echo "9) LOGIN -> DEFAULT TIER — /login now also grants the 'default' label."
+echo "   Expect: /account (needs default) opens; /admin (needs adm) still 302s."
+hr
+: > "$JAR" # fresh client after step 7's revoke
+curl -si -c "$JAR" "$BASE/login" | grep -iE '^HTTP/|^set-cookie:' || true
+BODY=$(curl -s -b "$JAR" -c "$JAR" "$BASE/account")
+echo "$BODY"
+echo "$BODY" | grep -q 'account area' || fail "default label did not open /account"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H 'Accept: text/html' "$BASE/admin")
+[ "$CODE" = "302" ] || fail "/admin should still 302 with only default (got $CODE)"
+echo "/account -> 200, /admin -> 302 (logged in != holding every label)"
+
+hr
+echo "10) STEP-UP — /mfa grants 'default adm'; the label change ROTATES the cookie."
+echo "    Expect: new __gosestor value, /admin opens, X-Session-Labels never leaks."
+hr
+OLD_KEY=$(proxy_cookie)
+[ -n "$OLD_KEY" ] || fail "no proxy cookie before step-up"
+HDRS=$(curl -si -b "$JAR" -c "$JAR" "$BASE/mfa")
+echo "$HDRS" | grep -iE '^HTTP/|^set-cookie:' || true
+if echo "$HDRS" | grep -qi '^x-session-labels:'; then
+    fail "X-Session-Labels leaked to the client"
+fi
+NEW_KEY=$(proxy_cookie)
+[ -n "$NEW_KEY" ] || fail "proxy cookie vanished after step-up"
+[ "$NEW_KEY" != "$OLD_KEY" ] || fail "label upgrade did not rotate the KEY_ID"
+echo "rotated on privilege change: ...${OLD_KEY: -8} -> ...${NEW_KEY: -8}"
+BODY=$(curl -s -b "$JAR" -c "$JAR" "$BASE/admin")
+echo "$BODY"
+echo "$BODY" | grep -q 'admin area' || fail "adm label did not open /admin"
+
+hr
+echo "11) STEP-DOWN — /stepdown grants only 'default'; adm is revoked, cookie rotates."
+echo "    Expect: /admin 302s again, /account still opens."
+hr
+OLD_KEY=$(proxy_cookie)
+curl -s -o /dev/null -b "$JAR" -c "$JAR" "$BASE/stepdown"
+NEW_KEY=$(proxy_cookie)
+[ "$NEW_KEY" != "$OLD_KEY" ] || fail "step-down did not rotate the KEY_ID"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H 'Accept: text/html' "$BASE/admin")
+[ "$CODE" = "302" ] || fail "/admin should 302 after step-down (got $CODE)"
+BODY=$(curl -s -b "$JAR" -c "$JAR" "$BASE/account")
+echo "$BODY" | grep -q 'account area' || fail "default tier lost after step-down"
+echo "adm revoked: /admin -> 302, /account still 200 (rotated: ...${OLD_KEY: -8} -> ...${NEW_KEY: -8})"
+
 echo
 echo "Done — all checks passed."
