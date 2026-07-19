@@ -378,3 +378,64 @@ func TestCleanupClosesRedisClient(t *testing.T) {
 		t.Fatalf("client not closed after Cleanup: %v", err)
 	}
 }
+
+// TestUnmarshalRotateHeader: the rotate_header directive accepts a custom
+// name or the literal "off"; absent leaves the field empty (resolved to the
+// default in Provision).
+func TestUnmarshalRotateHeader(t *testing.T) {
+	cases := []struct{ name, config, want string }{
+		{"default", "session_store {\n}", ""},
+		{"custom", "session_store {\n\trotate_header X-Rotate-Now\n}", "X-Rotate-Now"},
+		{"off", "session_store {\n\trotate_header off\n}", "off"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := caddyfile.NewTestDispenser(tc.config)
+			var h Handler
+			if err := h.UnmarshalCaddyfile(d); err != nil {
+				t.Fatal(err)
+			}
+			if h.RotateHeader != tc.want {
+				t.Fatalf("RotateHeader = %q, want %q", h.RotateHeader, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveRotateHeader: "" enables the default name; a custom name enables
+// itself; "off" disables triggering but keeps the default name for stripping,
+// so a disabled deployment still never leaks the header to clients.
+func TestResolveRotateHeader(t *testing.T) {
+	cases := []struct {
+		name, configured, wantName string
+		wantEnabled                bool
+	}{
+		{"default-on", "", "X-Session-Rotate", true},
+		{"custom-on", "X-Rotate-Now", "X-Rotate-Now", true},
+		{"off-still-strips-default", "off", "X-Session-Rotate", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{RotateHeader: tc.configured}
+			h.resolveRotateHeader()
+			if h.rotateHeaderName != tc.wantName || h.rotateEnabled != tc.wantEnabled {
+				t.Fatalf("got (%q, %v), want (%q, %v)",
+					h.rotateHeaderName, h.rotateEnabled, tc.wantName, tc.wantEnabled)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsRotateIdentityCollision: one header carries a boolean,
+// the other an owner id — a shared name would make the backend's value
+// ambiguous and one feature would silently eat the other's header.
+func TestValidateRejectsRotateIdentityCollision(t *testing.T) {
+	h := &Handler{
+		Redis:          RedisConfig{Address: "localhost:6379"},
+		OnStoreError:   "fail_closed",
+		IdentityHeader: "X-Session-Rotate", // collides with the rotate default
+	}
+	if err := h.Validate(); err == nil {
+		t.Fatal("rotate_header colliding with identity_header must be rejected")
+	}
+}

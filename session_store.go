@@ -60,15 +60,26 @@ type Handler struct {
 	// to false and silently disable the fixation defense for JSON users.
 	RotateOnLogin  *bool          `json:"rotate_on_login,omitempty"`
 	RotateInterval caddy.Duration `json:"rotate_interval,omitempty"`
-	Synchronize    bool           `json:"synchronize_sessions,omitempty"`
-	OnStoreError   string         `json:"on_store_error,omitempty"`
+	// RotateHeader names the backend response header that requests a KEY_ID
+	// rotation (step-up re-auth, suspicious account, …). Empty = default
+	// "X-Session-Rotate", enabled. The literal "off" disables triggering, but
+	// the default name is still stripped from responses so backend signaling
+	// never reaches the client.
+	RotateHeader string `json:"rotate_header,omitempty"`
+	Synchronize  bool   `json:"synchronize_sessions,omitempty"`
+	OnStoreError string `json:"on_store_error,omitempty"`
 
-	filter      *filter.Filter
-	manager     *session.Manager
-	store       store.Store
-	redisClient *redis.Client
-	logger      *zap.Logger
+	filter           *filter.Filter
+	manager          *session.Manager
+	store            store.Store
+	redisClient      *redis.Client
+	logger           *zap.Logger
+	rotateHeaderName string // effective header to read + strip
+	rotateEnabled    bool
 }
+
+// defaultRotateHeader is the backend-facing rotation-request header name.
+const defaultRotateHeader = "X-Session-Rotate"
 
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -200,6 +211,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.RotateInterval = caddy.Duration(dur)
+			case "rotate_header":
+				// Custom header name, or the literal "off" to disable.
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.RotateHeader = d.Val()
 			case "synchronize_sessions":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -244,9 +261,27 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		RotateOnLogin:  h.RotateOnLogin == nil || *h.RotateOnLogin, // nil = default true (fail safe)
 		RotateInterval: time.Duration(h.RotateInterval),
 	}, nil)
+	h.resolveRotateHeader()
 	// Expose this manager to the admin revoke endpoint (admin.api.gosestor).
 	registerRevoker(h)
 	return nil
+}
+
+// resolveRotateHeader computes the effective rotation-header behavior from
+// the user-facing RotateHeader value. Runs in Provision so raw-JSON configs
+// get the same fail-safe default as Caddyfile ones.
+func (h *Handler) resolveRotateHeader() {
+	switch {
+	case strings.EqualFold(h.RotateHeader, "off"):
+		h.rotateHeaderName = defaultRotateHeader
+		h.rotateEnabled = false
+	case h.RotateHeader == "":
+		h.rotateHeaderName = defaultRotateHeader
+		h.rotateEnabled = true
+	default:
+		h.rotateHeaderName = h.RotateHeader
+		h.rotateEnabled = true
+	}
 }
 
 // Cleanup deregisters this handler from the admin revoke registry when the
@@ -279,6 +314,16 @@ func (h *Handler) Validate() error {
 	// configure — reject them so a typo can't turn off a timeout or rotation.
 	if h.InactiveTimeout < 0 || h.FinalTimeout < 0 || h.RotateInterval < 0 {
 		return fmt.Errorf("session_store: inactive_timeout, final_timeout, and rotate_interval must not be negative")
+	}
+	// The rotation header and identity header must differ: one carries a
+	// boolean, the other an owner id — a shared name would make the backend's
+	// value ambiguous and one feature would silently eat the other's header.
+	effRotate := h.RotateHeader
+	if effRotate == "" {
+		effRotate = defaultRotateHeader
+	}
+	if !strings.EqualFold(effRotate, "off") && strings.EqualFold(effRotate, h.IdentityHeader) {
+		return fmt.Errorf("session_store: rotate_header %q collides with identity_header", effRotate)
 	}
 	return nil
 }
