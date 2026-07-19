@@ -590,3 +590,87 @@ func TestRotateHeaderWithoutSessionMintsNothing(t *testing.T) {
 		t.Fatalf("session minted for a bare rotation request: %v", scs)
 	}
 }
+
+// TestUnmarshalAuthzBlock: the authz block parses into the public config
+// verbatim; interpretation (defaults, validation) happens later.
+func TestUnmarshalAuthzBlock(t *testing.T) {
+	input := `session_store {
+		labels_header X-My-Labels
+		authz {
+			require /auth anonymous
+			require /admin adm
+			require_default default
+			auth_endpoint default /auth/login
+			auth_endpoint adm /auth/mfa
+			redirect_param next
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatal(err)
+	}
+	if h.LabelsHeader != "X-My-Labels" {
+		t.Fatalf("LabelsHeader = %q", h.LabelsHeader)
+	}
+	if h.Authz == nil {
+		t.Fatal("authz block not parsed")
+	}
+	if len(h.Authz.Rules) != 2 || h.Authz.Rules[1] != (AuthzRule{Path: "/admin", Label: "adm"}) {
+		t.Fatalf("rules = %+v", h.Authz.Rules)
+	}
+	if h.Authz.DefaultLabel != "default" || h.Authz.RedirectParam != "next" {
+		t.Fatalf("default/param = %q/%q", h.Authz.DefaultLabel, h.Authz.RedirectParam)
+	}
+	if h.Authz.AuthEndpoints["adm"] != "/auth/mfa" {
+		t.Fatalf("endpoints = %v", h.Authz.AuthEndpoints)
+	}
+}
+
+// TestUnmarshalNoAuthzMeansOff: absent block leaves Authz nil — the feature
+// is entirely off and existing configs behave unchanged.
+func TestUnmarshalNoAuthzMeansOff(t *testing.T) {
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser("session_store {\n}")); err != nil {
+		t.Fatal(err)
+	}
+	if h.Authz != nil {
+		t.Fatalf("Authz should be nil when the block is absent, got %+v", h.Authz)
+	}
+}
+
+// TestValidateLabelsHeaderCollision: the labels header must not collide with
+// the identity or rotation headers — a shared name would make one feature
+// silently eat another's grants.
+func TestValidateLabelsHeaderCollision(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Handler)
+	}{
+		{"identity", func(h *Handler) { h.IdentityHeader = "X-Session-Labels" }},
+		{"rotate", func(h *Handler) { h.RotateHeader = "X-Session-Labels" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{Redis: RedisConfig{Address: "localhost:6379"}, OnStoreError: "fail_closed"}
+			tc.mut(h)
+			if err := h.Validate(); err == nil {
+				t.Fatal("labels header collision must be rejected")
+			}
+		})
+	}
+}
+
+// TestValidateAuthzRedirectLoop: authz config errors surface in Validate —
+// most importantly an auth endpoint living under a protected prefix.
+func TestValidateAuthzRedirectLoop(t *testing.T) {
+	h := &Handler{
+		Redis:        RedisConfig{Address: "localhost:6379"},
+		OnStoreError: "fail_closed",
+		Authz: &AuthzConfig{
+			Rules:         []AuthzRule{{Path: "/admin", Label: "adm"}},
+			AuthEndpoints: map[string]string{"adm": "/admin/login"},
+		},
+	}
+	if err := h.Validate(); err == nil || !strings.Contains(err.Error(), "redirect loop") {
+		t.Fatalf("redirect loop not caught: %v", err)
+	}
+}

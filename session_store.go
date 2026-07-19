@@ -20,6 +20,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/fretscha/gosestor/internal/authz"
 	"github.com/fretscha/gosestor/internal/filter"
 	"github.com/fretscha/gosestor/internal/session"
 	"github.com/fretscha/gosestor/internal/store"
@@ -66,8 +67,15 @@ type Handler struct {
 	// the default name is still stripped from responses so backend signaling
 	// never reaches the client.
 	RotateHeader string `json:"rotate_header,omitempty"`
-	Synchronize  bool   `json:"synchronize_sessions,omitempty"`
-	OnStoreError string `json:"on_store_error,omitempty"`
+	// LabelsHeader names the backend response header that grants session
+	// labels (space/comma-separated; presence REPLACES the set, empty clears
+	// it). Empty = default "X-Session-Labels". Parsed and stripped even when
+	// authz is off, so grants can accumulate before enforcement is enabled.
+	LabelsHeader string `json:"labels_header,omitempty"`
+	// Authz enables path-based authorization; nil = feature off.
+	Authz        *AuthzConfig `json:"authz,omitempty"`
+	Synchronize  bool         `json:"synchronize_sessions,omitempty"`
+	OnStoreError string       `json:"on_store_error,omitempty"`
 
 	filter           *filter.Filter
 	manager          *session.Manager
@@ -76,10 +84,30 @@ type Handler struct {
 	logger           *zap.Logger
 	rotateHeaderName string // effective header to read + strip
 	rotateEnabled    bool
+	labelsHeaderName string // effective labels header to read + strip
+	authz            *authz.Authz
 }
 
 // defaultRotateHeader is the backend-facing rotation-request header name.
 const defaultRotateHeader = "X-Session-Rotate"
+
+// defaultLabelsHeader is the backend-facing label-grant header name.
+const defaultLabelsHeader = "X-Session-Labels"
+
+// AuthzConfig is the user-facing shape of the authz block; compiled and
+// validated by internal/authz.
+type AuthzConfig struct {
+	Rules         []AuthzRule       `json:"rules,omitempty"`
+	DefaultLabel  string            `json:"default_label,omitempty"`  // "" = anonymous
+	AuthEndpoints map[string]string `json:"auth_endpoints,omitempty"` // label -> path
+	RedirectParam string            `json:"redirect_param,omitempty"` // "" = "rd"
+}
+
+// AuthzRule maps a path prefix to a required label.
+type AuthzRule struct {
+	Path  string `json:"path"`
+	Label string `json:"label"`
+}
 
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -217,6 +245,46 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.RotateHeader = d.Val()
+			case "labels_header":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.LabelsHeader = d.Val()
+			case "authz":
+				if h.Authz == nil {
+					h.Authz = &AuthzConfig{}
+				}
+				for d.NextBlock(1) {
+					switch d.Val() {
+					case "require":
+						args := d.RemainingArgs()
+						if len(args) != 2 {
+							return d.Errf("require expects <path> <label>")
+						}
+						h.Authz.Rules = append(h.Authz.Rules, AuthzRule{Path: args[0], Label: args[1]})
+					case "require_default":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						h.Authz.DefaultLabel = d.Val()
+					case "auth_endpoint":
+						args := d.RemainingArgs()
+						if len(args) != 2 {
+							return d.Errf("auth_endpoint expects <label> <path>")
+						}
+						if h.Authz.AuthEndpoints == nil {
+							h.Authz.AuthEndpoints = map[string]string{}
+						}
+						h.Authz.AuthEndpoints[args[0]] = args[1]
+					case "redirect_param":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						h.Authz.RedirectParam = d.Val()
+					default:
+						return d.Errf("unknown authz option %q", d.Val())
+					}
+				}
 			case "synchronize_sessions":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -262,9 +330,35 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		RotateInterval: time.Duration(h.RotateInterval),
 	}, nil)
 	h.resolveRotateHeader()
+	h.labelsHeaderName = h.LabelsHeader
+	if h.labelsHeaderName == "" {
+		h.labelsHeaderName = defaultLabelsHeader
+	}
+	if h.Authz != nil {
+		a, err := h.buildAuthz()
+		if err != nil {
+			return fmt.Errorf("session_store: %w", err)
+		}
+		h.authz = a
+	}
 	// Expose this manager to the admin revoke endpoint (admin.api.gosestor).
 	registerRevoker(h)
 	return nil
+}
+
+// buildAuthz compiles the user-facing authz config; shared by Provision
+// (to store the compiled policy) and Validate (to surface errors at load).
+func (h *Handler) buildAuthz() (*authz.Authz, error) {
+	rules := make([]authz.Rule, len(h.Authz.Rules))
+	for i, r := range h.Authz.Rules {
+		rules[i] = authz.Rule{Path: r.Path, Label: r.Label}
+	}
+	return authz.New(authz.Config{
+		Rules:         rules,
+		DefaultLabel:  h.Authz.DefaultLabel,
+		AuthEndpoints: h.Authz.AuthEndpoints,
+		RedirectParam: h.Authz.RedirectParam,
+	})
 }
 
 // resolveRotateHeader computes the effective rotation-header behavior from
@@ -324,6 +418,21 @@ func (h *Handler) Validate() error {
 	}
 	if !strings.EqualFold(effRotate, "off") && strings.EqualFold(effRotate, h.IdentityHeader) {
 		return fmt.Errorf("session_store: rotate_header %q collides with identity_header", effRotate)
+	}
+	// The labels header must differ from the identity and rotation headers —
+	// a shared name would make one feature silently eat another's grants.
+	effLabels := h.LabelsHeader
+	if effLabels == "" {
+		effLabels = defaultLabelsHeader
+	}
+	if strings.EqualFold(effLabels, h.IdentityHeader) ||
+		(!strings.EqualFold(effRotate, "off") && strings.EqualFold(effLabels, effRotate)) {
+		return fmt.Errorf("session_store: labels_header %q collides with another managed header", effLabels)
+	}
+	if h.Authz != nil {
+		if _, err := h.buildAuthz(); err != nil {
+			return fmt.Errorf("session_store: %w", err)
+		}
 	}
 	return nil
 }
