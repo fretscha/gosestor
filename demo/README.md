@@ -12,7 +12,7 @@ session cookies server-side and handing the client only an opaque proxy cookie.
 | `proxy`   | Caddy built from local source with gosestor, via `xcaddy`.           |
 
 The `proxy` image is built by compiling this repository's module into Caddy with
-`xcaddy build --with gosestor=.` inside a multi-stage Dockerfile (build context
+`xcaddy build --with github.com/fretscha/gosestor=.` inside a multi-stage Dockerfile (build context
 is the repo root), so it always reflects your working tree.
 
 ## Run

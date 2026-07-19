@@ -10,8 +10,8 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 
-	"gosestor/internal/session"
-	"gosestor/internal/store"
+	"github.com/fretscha/gosestor/internal/session"
+	"github.com/fretscha/gosestor/internal/store"
 )
 
 // newMemHandler builds a Handler backed by an in-memory store for admin tests.

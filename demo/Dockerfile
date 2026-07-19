@@ -8,7 +8,7 @@ FROM golang:1.26-bookworm AS builder
 ENV CGO_ENABLED=0
 RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 COPY . /src/gosestor
-RUN xcaddy build --with gosestor=/src/gosestor --output /out/caddy
+RUN xcaddy build --with github.com/fretscha/gosestor=/src/gosestor --output /out/caddy
 
 FROM debian:bookworm-slim
 RUN apt-get update \

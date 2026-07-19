@@ -10,7 +10,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 
-	"gosestor/internal/session"
+	"github.com/fretscha/gosestor/internal/session"
 )
 
 func init() {

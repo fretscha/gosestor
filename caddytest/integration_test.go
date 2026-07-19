@@ -10,7 +10,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/caddyserver/caddy/v2/caddytest"
 
-	_ "gosestor" // register the session_store handler
+	_ "github.com/fretscha/gosestor" // register the session_store handler
 )
 
 // stubBackend echoes control headers so tests can assert proxy behavior.

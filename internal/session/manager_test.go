@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"gosestor/internal/store"
+	"github.com/fretscha/gosestor/internal/store"
 )
 
 type fakeClock struct{ t time.Time }

@@ -17,9 +17,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
-	"gosestor/internal/filter"
-	"gosestor/internal/session"
-	"gosestor/internal/store"
+	"github.com/fretscha/gosestor/internal/filter"
+	"github.com/fretscha/gosestor/internal/session"
+	"github.com/fretscha/gosestor/internal/store"
 )
 
 // testClock is a manually-advanced session.Clock for handler-level tests.

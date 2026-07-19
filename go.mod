@@ -1,4 +1,4 @@
-module gosestor
+module github.com/fretscha/gosestor
 
 go 1.26.4
 

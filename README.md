@@ -11,7 +11,10 @@ Planned and deferred work is tracked in the [backlog](docs/backlog.md).
 
 ## Build
 
-    xcaddy build --with gosestor=.
+    xcaddy build --with github.com/fretscha/gosestor
+
+    # or, from a local clone:
+    xcaddy build --with github.com/fretscha/gosestor=.
 
 ## Demo
 

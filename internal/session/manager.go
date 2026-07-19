@@ -9,7 +9,7 @@ import (
 	"io"
 	"time"
 
-	"gosestor/internal/store"
+	"github.com/fretscha/gosestor/internal/store"
 )
 
 // Config holds the timeout and behavior knobs the Manager needs.
