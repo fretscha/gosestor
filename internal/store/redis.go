@@ -36,6 +36,7 @@ func (r *Redis) PutSession(ctx context.Context, s Session, ttl time.Duration) er
 		"final_timeout":    s.FinalTimeout,
 		"owner_id":         s.OwnerID,
 		"last_rotation":    s.LastRotation,
+		"labels":           s.Labels,
 	})
 	if ttl > 0 {
 		pipe.Expire(ctx, r.sessKey(s.ID), ttl)
@@ -61,6 +62,7 @@ func (r *Redis) GetSession(ctx context.Context, id string) (Session, error) {
 		FinalTimeout:    atoi("final_timeout"),
 		OwnerID:         atoi("owner_id"),
 		LastRotation:    atoi("last_rotation"),
+		Labels:          vals["labels"],
 	}, nil
 }
 

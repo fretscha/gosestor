@@ -19,6 +19,9 @@ type Session struct {
 	FinalTimeout    int64
 	OwnerID         int64
 	LastRotation    int64 // Unix seconds of the last KEY_ID rotation (for rotate_interval)
+	// Labels is the session's authorization label set, space-joined and
+	// normalized (sorted, deduped) by the session manager. "" = no labels.
+	Labels string
 }
 
 // Store is the persistence contract. Implementations: in-memory (tests) and

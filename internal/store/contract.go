@@ -13,7 +13,7 @@ func RunContract(t *testing.T, newStore func() Store) {
 
 	t.Run("session round-trip", func(t *testing.T) {
 		s := newStore()
-		sess := Session{ID: "sid", Creation: 100, LastAccess: 100, InactiveTimeout: 1800, FinalTimeout: 28800}
+		sess := Session{ID: "sid", Creation: 100, LastAccess: 100, InactiveTimeout: 1800, FinalTimeout: 28800, Labels: "adm default"}
 		if err := s.PutSession(ctx, sess, time.Hour); err != nil {
 			t.Fatal(err)
 		}
@@ -23,6 +23,11 @@ func RunContract(t *testing.T, newStore func() Store) {
 		}
 		if got.ID != "sid" || got.FinalTimeout != 28800 {
 			t.Fatalf("got %+v", got)
+		}
+		// Labels persist round-trip; a legacy session without the field must
+		// read back as the empty set.
+		if got.Labels != "adm default" {
+			t.Fatalf("labels = %q, want %q", got.Labels, "adm default")
 		}
 	})
 
