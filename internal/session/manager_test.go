@@ -465,3 +465,104 @@ func TestRevokeOwnerPrunesStaleIndexEntries(t *testing.T) {
 		t.Fatalf("owner index not fully pruned after revoke: %v", sids)
 	}
 }
+
+// TestForceRotateHardDeletesOldKey: a backend-requested rotation mints a new
+// KEY_ID, kills the old one immediately (no grace — every backend trigger is
+// security-motivated), and keeps cached cookies reachable under the new key.
+func TestForceRotateHardDeletesOldKey(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	firstKey := live.KeyID
+	if err := live.StoreCookie(ctx, "JSESSIONID", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-resolve for a handle without the Begin-time rewrite pending —
+	// ForceRotate must do the work itself, not ride along on Begin's cookie.
+	got, err := m.Resolve(ctx, firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := got.ForceRotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	newKey, changed := got.NewProxyCookie()
+	if !changed || newKey == firstKey {
+		t.Fatalf("expected a fresh key, got %q (changed=%v)", newKey, changed)
+	}
+	if dead, _ := m.Resolve(ctx, firstKey); dead != nil {
+		t.Fatal("old key survived a forced rotation")
+	}
+	r, _ := m.Resolve(ctx, newKey)
+	if r == nil || r.Cookies["JSESSIONID"] != "secret" {
+		t.Fatalf("cached cookies lost across forced rotation: %+v", r)
+	}
+}
+
+// TestForceRotateNoOpWhenRewritePending: when BindOwner already rotated in
+// this response, a backend rotate request must not swap keys a second time —
+// the response can only deliver one cookie, and churning keys buys nothing.
+func TestForceRotateNoOpWhenRewritePending(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	got, err := m.Resolve(ctx, live.KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := got.BindOwner(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	loginKey, changed := got.NewProxyCookie()
+	if !changed {
+		t.Fatal("BindOwner should have rotated")
+	}
+
+	if err := got.ForceRotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	afterKey, _ := got.NewProxyCookie()
+	if afterKey != loginKey {
+		t.Fatalf("ForceRotate churned a second key: %q -> %q", loginKey, afterKey)
+	}
+	if r, _ := m.Resolve(ctx, loginKey); r == nil {
+		t.Fatal("login-rotated key must remain valid")
+	}
+}
+
+// TestForceRotateResetsIntervalClock: a forced rotation restarts the periodic
+// clock, so an interval rotation never immediately follows a requested one.
+func TestForceRotateResetsIntervalClock(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newRotatingManager(clk, 10*time.Minute)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	key := live.KeyID
+
+	clk.advance(6 * time.Minute)
+	got, err := m.Resolve(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := got.ForceRotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	forcedKey, _ := got.NewProxyCookie()
+
+	// 12m since Begin but only 6m since the forced rotation — the 10m
+	// interval must NOT fire.
+	clk.advance(6 * time.Minute)
+	got2, err := m.Resolve(ctx, forcedKey)
+	if err != nil || got2 == nil {
+		t.Fatalf("forced key must resolve: got=%+v err=%v", got2, err)
+	}
+	if err := got2.MaybeRotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed := got2.NewProxyCookie(); changed {
+		t.Fatal("interval rotation fired despite the forced rotation resetting the clock")
+	}
+}

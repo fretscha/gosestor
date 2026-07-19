@@ -193,6 +193,31 @@ func (l *Live) MaybeRotate(ctx context.Context) error {
 	return l.rotateKey(ctx, ttl)
 }
 
+// ForceRotate executes a backend-requested rotation (step-up re-auth,
+// suspicious account, …). Like MaybeRotate it must run on the response path,
+// under the per-session lock when synchronize_sessions is on. LastRotation is
+// persisted BEFORE the key swap — on a partial failure the client keeps its
+// still-valid old key — and the swap hard-deletes the old key: every backend
+// trigger is security-motivated, so the pre-trigger key must not keep
+// resolving to the now-elevated session. Setting LastRotation also resets the
+// periodic clock, so an interval rotation never immediately follows.
+func (l *Live) ForceRotate(ctx context.Context) error {
+	if l.rewrite {
+		return nil // a fresh key is already pending in this response
+	}
+	now := l.m.clock.Now().Unix()
+	sess, err := l.m.store.GetSession(ctx, l.SessionID)
+	if err != nil {
+		return err
+	}
+	sess.LastRotation = now
+	ttl := l.m.ttl(sess, now)
+	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
+		return err
+	}
+	return l.rotateKey(ctx, ttl)
+}
+
 // expired reports whether the session is past its inactive or final limit.
 func (m *Manager) expired(s store.Session, now int64) bool {
 	if now-s.LastAccess >= s.InactiveTimeout {
