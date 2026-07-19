@@ -3,18 +3,10 @@
 Living list of planned and deferred work. Ordered by priority within each
 section. The original v1 follow-ups (admin revoke endpoint,
 `rotate_interval` wiring, and `rotate_on_login false`) shipped on 2026-07-06
-(`f4335ab`).
+(`f4335ab`). The CI pipeline shipped on 2026-07-19 (`.github/workflows/ci.yml`,
+per [the design spec](designs/2026-07-19-ci-pipeline-design.md)).
 
 ## Next up
-
-### CI pipeline
-
-GitHub Actions workflow:
-
-- `go test -race -count=1 ./...`
-- `go vet ./...`
-- `gofmt -l` (fail on output)
-- xcaddy build smoke job (mirrors `demo/Dockerfile`)
 
 ### Backend-requested rotation header
 

@@ -1,6 +1,6 @@
 # CI Pipeline — Design
 
-Date: 2026-07-19. Status: approved. Implements the "CI pipeline" item from
+Date: 2026-07-19. Status: implemented. Addresses the "CI pipeline" item from
 [the backlog](../backlog.md).
 
 ## Goal
