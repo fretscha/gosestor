@@ -498,6 +498,7 @@ func (ic *interceptor) ensureProcessed() {
 		h := ic.ResponseWriter.Header()
 		h.Del("Set-Cookie")
 		h.Del(ic.h.IdentityHeader)
+		h.Del(ic.h.rotateHeaderName)
 		fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
 		if ic.live != nil {
 			fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
@@ -546,6 +547,25 @@ func (ic *interceptor) processLocked() error {
 		}
 	}
 
+	// (5b) Backend-requested rotation: read + strip the rotation header. Like
+	// the identity header it is deleted unconditionally — even when empty,
+	// invalid, or with the feature off — so it never reaches the client. A
+	// request with no live session triggers nothing: we never mint a session
+	// just to rotate it.
+	rotateRequested := false
+	rawRotate := hdr.Get(ic.h.rotateHeaderName)
+	hdr.Del(ic.h.rotateHeaderName)
+	if ic.h.rotateEnabled && rawRotate != "" {
+		want, err := strconv.ParseBool(rawRotate)
+		if err != nil {
+			// Explicit failure over guessing: an unparseable value is a backend
+			// bug worth surfacing, not a rotation.
+			ic.h.logger.Warn("invalid rotation header value",
+				zap.String("op", "response"), zap.String("value", rawRotate))
+		}
+		rotateRequested = err == nil && want
+	}
+
 	// (6) Filter each captured Set-Cookie: forward / store / drop.
 	for _, sc := range setCookies {
 		name, value := parseSetCookie(sc)
@@ -564,13 +584,18 @@ func (ic *interceptor) processLocked() error {
 		}
 	}
 
-	// (6b) Interval rotation, decided in Resolve but executed only here — after
-	// the upstream completed, as the LAST fallible step, under the session lock.
-	// Any earlier failure returns before the old KEY_ID is touched, so the
-	// client's cookie is never invalidated without its replacement being
-	// guaranteed a spot in this response.
+	// (6b) Rotation, executed only here — after the upstream completed, as the
+	// LAST fallible step, under the session lock. Any earlier failure returns
+	// before the old KEY_ID is touched, so the client's cookie is never
+	// invalidated without its replacement being guaranteed a spot in this
+	// response. A backend-requested rotation takes precedence; ForceRotate
+	// no-ops when this response already carries a fresh key.
 	if ic.live != nil {
-		if err := ic.live.MaybeRotate(ic.ctx); err != nil {
+		if rotateRequested {
+			if err := ic.live.ForceRotate(ic.ctx); err != nil {
+				return err
+			}
+		} else if err := ic.live.MaybeRotate(ic.ctx); err != nil {
 			return err
 		}
 	}

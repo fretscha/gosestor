@@ -39,13 +39,15 @@ func newRotationTestHandler(clk session.Clock) (*Handler, *session.Manager, *sto
 		RotateInterval: 10 * time.Minute,
 	}, nil)
 	h := &Handler{
-		Cookie:         CookieConfig{Name: "__gosestor"},
-		IdentityHeader: "X-Auth-User",
-		OnStoreError:   "fail_closed",
-		manager:        mgr,
-		store:          st,
-		filter:         filter.New(nil, []string{"JSESSIONID"}),
-		logger:         zap.NewNop(),
+		Cookie:           CookieConfig{Name: "__gosestor"},
+		IdentityHeader:   "X-Auth-User",
+		OnStoreError:     "fail_closed",
+		manager:          mgr,
+		store:            st,
+		filter:           filter.New(nil, []string{"JSESSIONID"}),
+		logger:           zap.NewNop(),
+		rotateHeaderName: "X-Session-Rotate",
+		rotateEnabled:    true,
 	}
 	return h, mgr, st
 }
@@ -437,5 +439,154 @@ func TestValidateRejectsRotateIdentityCollision(t *testing.T) {
 	}
 	if err := h.Validate(); err == nil {
 		t.Fatal("rotate_header colliding with identity_header must be rejected")
+	}
+}
+
+// TestRotateHeaderRotatesAndStrips: X-Session-Rotate: 1 from the backend
+// swaps the proxy cookie, kills the old key, and never reaches the client.
+func TestRotateHeaderRotatesAndStrips(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newRotationTestHandler(clk)
+
+	live, err := mgr.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Rotate", "1")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rec.Result().Header.Get("X-Session-Rotate"); got != "" {
+		t.Fatalf("rotation header leaked to client: %q", got)
+	}
+	var newKey string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			newKey = c.Value
+		}
+	}
+	if newKey == "" || newKey == key {
+		t.Fatalf("expected a rotated proxy cookie, got %q", newKey)
+	}
+	if old, _ := mgr.Resolve(ctx, key); old != nil {
+		t.Fatal("old key survived a backend-requested rotation")
+	}
+	if fresh, _ := mgr.Resolve(ctx, newKey); fresh == nil {
+		t.Fatal("rotated key does not resolve")
+	}
+}
+
+// TestRotateHeaderDisabledStillStrips: with rotate_header off the value is
+// ignored — no rotation — but the header is still stripped so backend
+// signaling never leaks to the client.
+func TestRotateHeaderDisabledStillStrips(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newRotationTestHandler(clk)
+	h.rotateEnabled = false
+
+	live, err := mgr.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Rotate", "1")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rec.Result().Header.Get("X-Session-Rotate"); got != "" {
+		t.Fatalf("rotation header leaked with feature disabled: %q", got)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			t.Fatalf("rotation ran despite rotate_header off: new cookie %q", c.Value)
+		}
+	}
+	if r, _ := mgr.Resolve(ctx, key); r == nil {
+		t.Fatal("key must survive when rotation is disabled")
+	}
+}
+
+// TestRotateHeaderInvalidValueNoRotate: an unparseable value must not rotate
+// (explicit failure over guessing) and must still be stripped.
+func TestRotateHeaderInvalidValueNoRotate(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newRotationTestHandler(clk)
+
+	live, err := mgr.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Rotate", "banana")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rec.Result().Header.Get("X-Session-Rotate"); got != "" {
+		t.Fatalf("invalid rotation header leaked to client: %q", got)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			t.Fatalf("rotation ran on invalid value: new cookie %q", c.Value)
+		}
+	}
+	if r, _ := mgr.Resolve(ctx, key); r == nil {
+		t.Fatal("key must survive an invalid rotation value")
+	}
+}
+
+// TestRotateHeaderWithoutSessionMintsNothing: a rotation request with no live
+// session is a no-op — we never mint a session just to rotate it (mirrors the
+// identity-header guard).
+func TestRotateHeaderWithoutSessionMintsNothing(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil) // no cookie
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Rotate", "1")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rec.Result().Header.Get("X-Session-Rotate"); got != "" {
+		t.Fatalf("rotation header leaked to client: %q", got)
+	}
+	if scs := rec.Result().Header["Set-Cookie"]; len(scs) != 0 {
+		t.Fatalf("session minted for a bare rotation request: %v", scs)
 	}
 }
