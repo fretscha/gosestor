@@ -11,13 +11,12 @@ The backend-requested rotation header (`rotate_header`, default
 Path-based authorization with labels (`authz` block + `labels_header`)
 shipped the same day per
 [its design spec](designs/2026-07-19-authz-labels-design.md).
+The demo authz walkthrough (steps 8–11) shipped on 2026-07-19 per
+[its design spec](designs/2026-07-19-demo-authz-design.md).
 
 ## Next up
 
-### Demo: authz walkthrough
-
-Extend `demo/` with the authz block and a step showing deny → login →
-step-up → step-down against the Docker stack.
+(empty — see deferred items below)
 
 ## Deferred until there is a real workload to measure against
 

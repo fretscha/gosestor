@@ -1,6 +1,6 @@
 # Demo: Authz Walkthrough — Design
 
-Date: 2026-07-19. Status: approved. Implements the "Demo: authz
+Date: 2026-07-19. Status: implemented. Addresses the "Demo: authz
 walkthrough" backlog item, demonstrating the feature shipped per
 [the authz design spec](2026-07-19-authz-labels-design.md).
 
