@@ -1,6 +1,6 @@
 # Backend-Requested Rotation Header — Design
 
-Date: 2026-07-19. Status: approved. Implements the "Backend-requested
+Date: 2026-07-19. Status: implemented. Addresses the "Backend-requested
 rotation header" item from [the backlog](../backlog.md).
 
 ## Problem

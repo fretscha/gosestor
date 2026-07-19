@@ -154,6 +154,24 @@ Legacy sessions (created before `rotate_interval` existed) have
 `last_rotation == 0`; `Resolve` backfills the clock instead of mass-rotating
 the whole fleet on the first post-upgrade request.
 
+**Backend-requested rotation** (`ForceRotate`) closes the gap the other two
+triggers leave: `rotate_on_login` only fires on an owner-id *transition*, so a
+privilege change under the same owner (MFA step-up, sudo-mode, password
+change) never rotates — and gosestor cannot detect those events itself. The
+backend signals instead, by setting `rotate_header` (default
+`X-Session-Rotate`) truthy on any response. The handler reads and
+unconditionally strips the header at step 5b — enabled, disabled, or invalid,
+it never reaches the client, including via the `ensureProcessed` error scrub —
+and executes at step 6b in place of `MaybeRotate`. `ForceRotate` follows the
+same crash-ordering as interval rotation (`LastRotation` persisted before the
+swap, so a partial failure leaves the client's key valid), hard-deletes the
+old key via the shared `rotateKey` (every backend trigger is
+security-motivated; the pre-trigger key must not keep resolving to the
+now-elevated session), and no-ops when `rewrite` is already pending — login +
+rotate request in one response means exactly one swap. Setting `LastRotation`
+also resets the periodic clock, so an interval rotation never immediately
+follows a requested one.
+
 ## 5. Storage — `internal/store/`
 
 Redis layout (all under a configurable prefix):

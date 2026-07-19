@@ -50,6 +50,7 @@ backend. See [`demo/README.md`](demo/README.md).
             identity_header   X-Auth-User
             rotate_on_login   true
             rotate_interval   15m
+            rotate_header     X-Session-Rotate
             synchronize_sessions  false
             on_store_error    fail_closed
         }
@@ -74,12 +75,21 @@ backend. See [`demo/README.md`](demo/README.md).
   decided on the request path but **executed only on the response path**, after
   the upstream succeeded — a failed request can never invalidate the client's
   cookie without its replacement being delivered in the same response.
+- `rotate_on_login` only rotates on an owner-id *transition*. For privilege
+  changes under the same owner (MFA step-up, sudo-mode, password change), the
+  backend can set `X-Session-Rotate: 1` on any response: gosestor strips the
+  header and hard-rotates the proxy cookie, per OWASP's "renew the session id
+  on any privilege change". Enabled by default; `rotate_header off` disables
+  triggering (the default header name is still stripped), and `rotate_header
+  <name>` renames it. Values are parsed with `strconv.ParseBool`; unparseable
+  values log a warning and do not rotate.
 - The backend signals identity via `identity_header` with a **positive integer**
   owner id; `0` is the anonymous sentinel and negative values are ignored.
 - `identity_header` is stripped from both the request (anti-spoof) and response.
 - `on_store_error fail_closed` returns 502 rather than leaking backend cookies
   when the store is unreachable. On **any** response-path failure (either mode),
-  all `Set-Cookie` and the identity header are scrubbed before flushing — so under
+  all `Set-Cookie`, the identity header, and the rotation header are scrubbed
+  before flushing — so under
   `fail_open` a `forward`-listed cookie (e.g. a CSRF token) emitted during a
   transient store error is dropped rather than leaked.
 
