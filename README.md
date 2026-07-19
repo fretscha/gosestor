@@ -51,6 +51,14 @@ backend. See [`demo/README.md`](demo/README.md).
             rotate_on_login   true
             rotate_interval   15m
             rotate_header     X-Session-Rotate
+            labels_header     X-Session-Labels
+            authz {
+                require /auth   anonymous
+                require /admin  adm
+                require_default default
+                auth_endpoint default /auth/login
+                auth_endpoint adm     /auth/mfa
+            }
             synchronize_sessions  false
             on_store_error    fail_closed
         }
@@ -83,6 +91,19 @@ backend. See [`demo/README.md`](demo/README.md).
   triggering (the default header name is still stripped), and `rotate_header
   <name>` renames it. Values are parsed with `strconv.ParseBool`; unparseable
   values log a warning and do not rotate.
+- With an `authz` block, gosestor enforces path-based authorization: `require`
+  rules map path prefixes to labels (longest prefix wins, segment-aware,
+  matched on the cleaned path), `require_default` covers unlisted paths, and
+  `anonymous` marks public paths. The backend grants labels via
+  `labels_header` (default `X-Session-Labels`; presence **replaces** the set,
+  empty clears it, absent changes nothing — stripped from every response). A
+  label-set change rotates the proxy cookie automatically. Requests lacking
+  the required label never reach the backend: browsers get a 302 to that
+  label's `auth_endpoint` with the original path in `?rd=`, other clients a
+  401 plus `X-Auth-Endpoint`. Validation rejects auth endpoints that live
+  under a protected prefix (redirect loop) at config load. With the store
+  down, protected paths are denied even under `fail_open` — authz always
+  fails closed.
 - The backend signals identity via `identity_header` with a **positive integer**
   owner id; `0` is the anonymous sentinel and negative values are ignored.
 - `identity_header` is stripped from both the request (anti-spoof) and response.

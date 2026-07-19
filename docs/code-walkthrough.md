@@ -172,6 +172,34 @@ rotate request in one response means exactly one swap. Setting `LastRotation`
 also resets the periodic clock, so an interval rotation never immediately
 follows a requested one.
 
+**Labels and path-based authorization** (`internal/authz` + steps 1b/5c) turn
+the proxy into the authorization enforcement point. `internal/authz`
+compiles `require` rules once at Provision: paths are `path.Clean`ed, sorted
+longest-first, and matched segment-aware (`/admin` covers `/admin/users`, not
+`/administrator`), so neither traversal nor duplicate slashes can dodge or
+spoof a rule and declaration order never matters. Load-time validation
+rejects a label with no `auth_endpoint` and — the important one — an auth
+endpoint living under a protected prefix, which would be a redirect loop.
+
+On the request path (step 1b, before the upstream is called) the required
+label must be present in the session's label set; `anonymous` paths
+short-circuit. A denied browser gets a 302 to the label's endpoint with the
+original path+query in the redirect parameter (built only from server config
+and the request's own URL — no open-redirect surface); other clients get a
+401 with `X-Auth-Endpoint`. Because an unresolvable session has no provable
+labels, authz fails CLOSED with the store down even under
+`on_store_error fail_open`.
+
+On the response path (step 5c) the labels header is read and unconditionally
+stripped — including the `ensureProcessed` error scrub. Presence REPLACES the
+session's set (downgrade is the same operation as upgrade), an empty value
+clears it, absence changes nothing. A grant with no live session mints one
+(unless the grant is empty); the reserved `anonymous` label is dropped from
+grants with a warning. `SetLabels` persists the normalized set and rotates
+the KEY_ID on change — a label change is a same-owner privilege change — via
+the shared `rotateKey`, behind the same `rewrite` guard: login + grant in one
+response still means exactly one swap.
+
 ## 5. Storage — `internal/store/`
 
 Redis layout (all under a configurable prefix):

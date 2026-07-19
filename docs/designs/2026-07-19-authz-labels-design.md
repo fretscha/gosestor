@@ -1,6 +1,6 @@
 # Path-Based Authorization with Labels — Design
 
-Date: 2026-07-19. Status: approved. The design uses enforcement inside the
+Date: 2026-07-19. Status: implemented using enforcement inside the
 `session_store` handler.
 
 ## Problem

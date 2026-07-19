@@ -8,10 +8,16 @@ per [the design spec](designs/2026-07-19-ci-pipeline-design.md)).
 The backend-requested rotation header (`rotate_header`, default
 `X-Session-Rotate`) also shipped on 2026-07-19, per
 [its design spec](designs/2026-07-19-rotate-header-design.md).
+Path-based authorization with labels (`authz` block + `labels_header`)
+shipped the same day per
+[its design spec](designs/2026-07-19-authz-labels-design.md).
 
 ## Next up
 
-(empty — see deferred items below)
+### Demo: authz walkthrough
+
+Extend `demo/` with the authz block and a step showing deny → login →
+step-up → step-down against the Docker stack.
 
 ## Deferred until there is a real workload to measure against
 
