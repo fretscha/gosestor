@@ -37,6 +37,16 @@ func stubBackend(t *testing.T) *httptest.Server {
 		if r.URL.Path == "/rotate-and-store" {
 			w.Header().Set("Set-Cookie", "JSESSIONID=elevated; Path=/")
 			w.Header().Set("X-Session-Rotate", "1")
+			w.Header().Set("X-Session-Labels", "adm")
+		}
+		if r.URL.Path == "/auth/login" {
+			w.Header().Set("X-Session-Labels", "default")
+		}
+		if r.URL.Path == "/auth/mfa" {
+			w.Header().Set("X-Session-Labels", "default adm")
+		}
+		if r.URL.Path == "/stepdown" {
+			w.Header().Set("X-Session-Labels", "default")
 		}
 		fmt.Fprintln(w, "ok")
 	}))
@@ -258,9 +268,156 @@ func TestStoreDownScrubsRotationHeader(t *testing.T) {
 	if got := resp.Header.Get("X-Session-Rotate"); got != "" {
 		t.Fatalf("rotation header leaked on the error path: %q", got)
 	}
+	if got := resp.Header.Get("X-Session-Labels"); got != "" {
+		t.Fatalf("labels header leaked on the error path: %q", got)
+	}
 	for _, sc := range resp.Header["Set-Cookie"] {
 		if strings.Contains(sc, "JSESSIONID") {
 			t.Fatalf("JSESSIONID leaked with store down: %q", sc)
 		}
+	}
+}
+
+// authzHarness is harness() plus the reference authz policy. Note unlisted
+// paths now fall under require_default, so this harness is only used by
+// authz tests.
+func authzHarness(t *testing.T) (*caddytest.Tester, *miniredis.Miniredis) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	backend := stubBackend(t)
+
+	tester := caddytest.NewTester(t)
+	config := fmt.Sprintf(`{
+		admin localhost:2999
+		order session_store before reverse_proxy
+	}
+	http://localhost:9080 {
+		session_store {
+			redis {
+				address %s
+			}
+			cookie {
+				name __gosestor
+				insecure
+			}
+			store JSESSIONID
+			identity_header X-Auth-User
+			on_store_error fail_closed
+			authz {
+				require /auth anonymous
+				require /admin adm
+				require /stepdown default
+				require_default default
+				auth_endpoint default /auth/login
+				auth_endpoint adm /auth/mfa
+			}
+		}
+		reverse_proxy %s
+	}`, mr.Addr(), strings.TrimPrefix(backend.URL, "http://"))
+	tester.InitServer(config, "caddyfile")
+	return tester, mr
+}
+
+// TestAuthzEndToEndJourney walks the full lifecycle through a real Caddy:
+// denied anonymously → login grants default (mints + cookie) → default areas
+// open, /admin still closed → MFA grants adm (cookie ROTATES) → /admin open →
+// step-down revokes adm (rotates again) → /admin closed again.
+func TestAuthzEndToEndJourney(t *testing.T) {
+	_, _ = authzHarness(t)
+	plain := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // inspect 302s instead of following
+		},
+	}
+	get := func(path string, cookie *http.Cookie, accept string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest("GET", "http://localhost:9080"+path, nil)
+		req.Header.Set("Accept", accept)
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+		resp, err := plain.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	proxyCookie := func(resp *http.Response) *http.Cookie {
+		for _, c := range resp.Cookies() {
+			if c.Name == "__gosestor" {
+				return c
+			}
+		}
+		return nil
+	}
+
+	// 1. Anonymous browser on /admin → 302 to the adm endpoint with rd.
+	r := get("/admin/panel", nil, "text/html")
+	if r.StatusCode != http.StatusFound {
+		t.Fatalf("step 1: code %d, want 302", r.StatusCode)
+	}
+	if loc := r.Header.Get("Location"); loc != "/auth/mfa?rd=%2Fadmin%2Fpanel" {
+		t.Fatalf("step 1: Location = %q", loc)
+	}
+
+	// 2. Anonymous API client → 401 + endpoint hint.
+	r = get("/admin/panel", nil, "application/json")
+	if r.StatusCode != http.StatusUnauthorized || r.Header.Get("X-Auth-Endpoint") != "/auth/mfa" {
+		t.Fatalf("step 2: code %d endpoint %q", r.StatusCode, r.Header.Get("X-Auth-Endpoint"))
+	}
+
+	// 3. Login (anonymous path) grants default → session minted.
+	r = get("/auth/login", nil, "text/html")
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("step 3: code %d", r.StatusCode)
+	}
+	if got := r.Header.Get("X-Session-Labels"); got != "" {
+		t.Fatalf("step 3: labels header leaked: %q", got)
+	}
+	c1 := proxyCookie(r)
+	if c1 == nil {
+		t.Fatal("step 3: no session minted on grant")
+	}
+
+	// 4. default-labeled session reaches a default path but not /admin.
+	if r = get("/anything", c1, "text/html"); r.StatusCode != http.StatusOK {
+		t.Fatalf("step 4a: code %d", r.StatusCode)
+	}
+	if r = get("/admin/panel", c1, "text/html"); r.StatusCode != http.StatusFound {
+		t.Fatalf("step 4b: code %d, want 302", r.StatusCode)
+	}
+
+	// 5. MFA grants default+adm → privilege change rotates the cookie.
+	r = get("/auth/mfa", c1, "text/html")
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("step 5: code %d", r.StatusCode)
+	}
+	c2 := proxyCookie(r)
+	if c2 == nil || c2.Value == c1.Value {
+		t.Fatal("step 5: label upgrade must rotate the proxy cookie")
+	}
+
+	// 6. adm session reaches /admin; the pre-upgrade cookie is dead.
+	if r = get("/admin/panel", c2, "text/html"); r.StatusCode != http.StatusOK {
+		t.Fatalf("step 6a: code %d", r.StatusCode)
+	}
+	if r = get("/admin/panel", c1, "text/html"); r.StatusCode != http.StatusFound {
+		t.Fatalf("step 6b: pre-upgrade cookie still works (code %d)", r.StatusCode)
+	}
+
+	// 7. Step-down back to default → rotates again, /admin closed again.
+	r = get("/stepdown", c2, "text/html")
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("step 7: code %d", r.StatusCode)
+	}
+	c3 := proxyCookie(r)
+	if c3 == nil || c3.Value == c2.Value {
+		t.Fatal("step 7: step-down must rotate")
+	}
+	if r = get("/admin/panel", c3, "text/html"); r.StatusCode != http.StatusFound {
+		t.Fatalf("step 8: adm survived step-down (code %d)", r.StatusCode)
 	}
 }
