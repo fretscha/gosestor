@@ -3,6 +3,7 @@ package gosestor
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/fretscha/gosestor/internal/authz"
 	"github.com/fretscha/gosestor/internal/filter"
 	"github.com/fretscha/gosestor/internal/session"
 	"github.com/fretscha/gosestor/internal/store"
@@ -672,5 +674,179 @@ func TestValidateAuthzRedirectLoop(t *testing.T) {
 	}
 	if err := h.Validate(); err == nil || !strings.Contains(err.Error(), "redirect loop") {
 		t.Fatalf("redirect loop not caught: %v", err)
+	}
+}
+
+// newAuthzTestHandler layers the reference authz policy over the rotation
+// test handler: /auth anonymous, /admin -> adm, everything else -> default.
+func newAuthzTestHandler(t *testing.T, clk session.Clock) (*Handler, *session.Manager, *store.Memory) {
+	t.Helper()
+	h, mgr, st := newRotationTestHandler(clk)
+	a, err := authz.New(authz.Config{
+		Rules: []authz.Rule{
+			{Path: "/auth", Label: authz.Anonymous},
+			{Path: "/admin", Label: "adm"},
+		},
+		DefaultLabel:  "default",
+		AuthEndpoints: map[string]string{"default": "/auth/login", "adm": "/auth/mfa"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.authz = a
+	h.labelsHeaderName = "X-Session-Labels"
+	return h, mgr, st
+}
+
+// okBackend is a next-handler that records whether it was reached.
+func okBackend(reached *bool) caddyhttp.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		*reached = true
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+}
+
+// TestAuthzAnonymousPathNeedsNoSession: an anonymous path proxies with no
+// session at all — the login endpoints themselves must be reachable.
+func TestAuthzAnonymousPathNeedsNoSession(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newAuthzTestHandler(t, clk)
+	var reached bool
+	req := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil)
+	rec := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec, req, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if !reached || rec.Code != http.StatusOK {
+		t.Fatalf("anonymous path blocked: reached=%v code=%d", reached, rec.Code)
+	}
+}
+
+// TestAuthzBrowserRedirect: a browser (Accept: text/html) lacking the label
+// gets a 302 to that label's endpoint with the original path+query in rd —
+// and the backend is NEVER called for a denied request.
+func TestAuthzBrowserRedirect(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newAuthzTestHandler(t, clk)
+	var reached bool
+	req := httptest.NewRequest(http.MethodGet, "http://x/admin/users?tab=1", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	rec := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec, req, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if reached {
+		t.Fatal("denied request reached the backend")
+	}
+	if rec.Code != http.StatusFound {
+		t.Fatalf("code = %d, want 302", rec.Code)
+	}
+	if got, want := rec.Header().Get("Location"), "/auth/mfa?rd=%2Fadmin%2Fusers%3Ftab%3D1"; got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
+	}
+}
+
+// TestAuthzAPIGets401: non-browser clients get a clean 401 plus the endpoint
+// in X-Auth-Endpoint so SPAs can redirect client-side.
+func TestAuthzAPIGets401(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newAuthzTestHandler(t, clk)
+	var reached bool
+	req := httptest.NewRequest(http.MethodGet, "http://x/admin", nil)
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec, req, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if reached || rec.Code != http.StatusUnauthorized {
+		t.Fatalf("reached=%v code=%d, want unreached 401", reached, rec.Code)
+	}
+	if got := rec.Header().Get("X-Auth-Endpoint"); got != "/auth/mfa" {
+		t.Fatalf("X-Auth-Endpoint = %q", got)
+	}
+}
+
+// TestAuthzLabeledSessionPasses: a session holding the required label is
+// proxied; one lacking it (but holding others) is not.
+func TestAuthzLabeledSessionPasses(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newAuthzTestHandler(t, clk)
+	live, _ := mgr.Begin(ctx)
+	if _, err := live.SetLabels(ctx, []string{"default", "adm"}); err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	var reached bool
+	req := httptest.NewRequest(http.MethodGet, "http://x/admin", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec, req, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if !reached {
+		t.Fatal("labeled session denied")
+	}
+
+	// default-only session must be bounced from /admin to the mfa endpoint.
+	live2, _ := mgr.Begin(ctx)
+	if _, err := live2.SetLabels(ctx, []string{"default"}); err != nil {
+		t.Fatal(err)
+	}
+	reached = false
+	req2 := httptest.NewRequest(http.MethodGet, "http://x/admin", nil)
+	req2.Header.Set("Cookie", "__gosestor="+live2.KeyID)
+	req2.Header.Set("Accept", "text/html")
+	rec2 := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec2, req2, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if reached || rec2.Code != http.StatusFound {
+		t.Fatalf("under-labeled session passed: reached=%v code=%d", reached, rec2.Code)
+	}
+}
+
+// errKeyStore makes session resolution fail, simulating a store outage.
+type errKeyStore struct{ store.Store }
+
+func (errKeyStore) GetKey(context.Context, string) (string, error) {
+	return "", errors.New("store down")
+}
+
+// TestAuthzFailsClosedUnderFailOpen: with on_store_error fail_open and the
+// store down, anonymous paths still proxy (caching degrades gracefully) but
+// protected paths are DENIED — a label that can't be proven doesn't exist.
+func TestAuthzFailsClosedUnderFailOpen(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, st := newAuthzTestHandler(t, clk)
+	h.OnStoreError = "fail_open"
+	h.store = errKeyStore{Store: st}
+	h.manager = session.NewManager(errKeyStore{Store: st}, clk, session.Config{
+		Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: true,
+	}, nil)
+
+	var reached bool
+	req := httptest.NewRequest(http.MethodGet, "http://x/admin", nil)
+	req.Header.Set("Cookie", "__gosestor=somekey")
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	if err := h.ServeHTTP(rec, req, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if reached || rec.Code != http.StatusUnauthorized {
+		t.Fatalf("authz failed OPEN: reached=%v code=%d", reached, rec.Code)
+	}
+
+	reached = false
+	reqAnon := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil)
+	reqAnon.Header.Set("Cookie", "__gosestor=somekey")
+	recAnon := httptest.NewRecorder()
+	if err := h.ServeHTTP(recAnon, reqAnon, okBackend(&reached)); err != nil {
+		t.Fatal(err)
+	}
+	if !reached {
+		t.Fatal("fail_open must still proxy anonymous paths with the store down")
 	}
 }

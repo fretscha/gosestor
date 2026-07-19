@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -471,6 +472,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			live = l
 		}
 	}
+	// (1b) Authorization: the required label must be provable BEFORE the
+	// request reaches the backend. A store failure above leaves live == nil,
+	// so a protected path fails CLOSED even under on_store_error fail_open —
+	// only the session-caching behavior of anonymous paths degrades open.
+	if h.authz != nil {
+		if required := h.authz.Required(r.URL.Path); required != authz.Anonymous {
+			if live == nil || !live.HasLabel(required) {
+				return h.denyAuthz(w, r, required)
+			}
+		}
+	}
+
 	// Always rewrite the upstream Cookie header: strip the opaque proxy key and
 	// any client-supplied store-managed cookie names (the server's cached values
 	// are authoritative), then inject the cached values. Runs even without a
@@ -523,6 +536,35 @@ func (h *Handler) prepareUpstreamCookies(r *http.Request, cached map[string]stri
 		return
 	}
 	r.Header.Set("Cookie", strings.Join(kept, "; "))
+}
+
+// denyAuthz answers a request whose session lacks the required label:
+// browsers (Accept contains text/html) get a 302 to the label's auth
+// endpoint carrying the original path+query in the redirect parameter;
+// everything else gets a 401 with the endpoint in X-Auth-Endpoint. The
+// redirect target is built exclusively from server config and the request's
+// own path+query — never from client-controlled parameters — so it cannot
+// become an open redirect.
+func (h *Handler) denyAuthz(w http.ResponseWriter, r *http.Request, required string) error {
+	endpoint := h.authz.Endpoint(required)
+	h.logger.Debug("authz denied",
+		zap.String("path", r.URL.Path), zap.String("required", required))
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		rd := r.URL.Path
+		if r.URL.RawQuery != "" {
+			rd += "?" + r.URL.RawQuery
+		}
+		sep := "?"
+		if strings.Contains(endpoint, "?") {
+			sep = "&"
+		}
+		w.Header().Set("Location", endpoint+sep+h.authz.RedirectParam()+"="+url.QueryEscape(rd))
+		w.WriteHeader(http.StatusFound)
+		return nil
+	}
+	w.Header().Set("X-Auth-Endpoint", endpoint)
+	w.WriteHeader(http.StatusUnauthorized)
+	return nil
 }
 
 // interceptor interface guards: streaming and upgrades must keep working
