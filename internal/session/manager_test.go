@@ -566,3 +566,123 @@ func TestForceRotateResetsIntervalClock(t *testing.T) {
 		t.Fatal("interval rotation fired despite the forced rotation resetting the clock")
 	}
 }
+
+// TestSetLabelsPersistsAndRotates: granting a changed label set persists the
+// normalized set AND rotates the key (hard delete) — a label change is a
+// privilege change, so OWASP's renew-on-privilege-change happens by default.
+func TestSetLabelsPersistsAndRotates(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	firstKey := live.KeyID
+	got, err := m.Resolve(ctx, firstKey) // drain the Begin-time rewrite
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := got.SetLabels(ctx, []string{"default", "adm", "adm", " "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("first grant must report changed")
+	}
+	newKey, rotated := got.NewProxyCookie()
+	if !rotated || newKey == firstKey {
+		t.Fatalf("label change must rotate: %q (rotated=%v)", newKey, rotated)
+	}
+	if dead, _ := m.Resolve(ctx, firstKey); dead != nil {
+		t.Fatal("old key survived a label-change rotation")
+	}
+	r, _ := m.Resolve(ctx, newKey)
+	if r == nil || !r.HasLabel("adm") || !r.HasLabel("default") || r.HasLabel("x") {
+		t.Fatalf("labels not persisted: %+v", r)
+	}
+	// Normalized: sorted, deduped, empties dropped.
+	if want := []string{"adm", "default"}; len(r.Labels) != 2 || r.Labels[0] != want[0] || r.Labels[1] != want[1] {
+		t.Fatalf("labels = %v, want %v", r.Labels, want)
+	}
+}
+
+// TestSetLabelsSameSetNoRotate: re-granting the same set (any order, with
+// duplicates) is a no-op — no rotation churn on every authenticated response.
+func TestSetLabelsSameSetNoRotate(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	got, _ := m.Resolve(ctx, live.KeyID)
+	if _, err := got.SetLabels(ctx, []string{"adm", "default"}); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := got.NewProxyCookie()
+
+	got2, err := m.Resolve(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := got2.SetLabels(ctx, []string{"default", "adm", "adm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("identical set must not report changed")
+	}
+	if _, rotated := got2.NewProxyCookie(); rotated {
+		t.Fatal("identical set must not rotate")
+	}
+}
+
+// TestSetLabelsClears: an explicit empty grant clears the set (step-down /
+// partial logout) and rotates — a downgrade is a privilege change too.
+func TestSetLabelsClears(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	got, _ := m.Resolve(ctx, live.KeyID)
+	_, _ = got.SetLabels(ctx, []string{"adm"})
+	key, _ := got.NewProxyCookie()
+
+	got2, _ := m.Resolve(ctx, key)
+	changed, err := got2.SetLabels(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("clearing a non-empty set must report changed")
+	}
+	newKey, _ := got2.NewProxyCookie()
+	r, _ := m.Resolve(ctx, newKey)
+	if r == nil || len(r.Labels) != 0 {
+		t.Fatalf("labels not cleared: %+v", r)
+	}
+}
+
+// TestSetLabelsRewritePendingSkipsRotation: when this response already swaps
+// the key (Begin/BindOwner/ForceRotate), labels still persist but no second
+// swap happens — one response, one cookie, one rotation.
+func TestSetLabelsRewritePendingSkipsRotation(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx) // rewrite already pending (fresh key)
+	beginKey := live.KeyID
+
+	changed, err := live.SetLabels(ctx, []string{"default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("grant must report changed")
+	}
+	pending, _ := live.NewProxyCookie()
+	if pending != beginKey {
+		t.Fatalf("second swap happened: %q != begin key %q", pending, beginKey)
+	}
+	r, _ := m.Resolve(ctx, beginKey)
+	if r == nil || !r.HasLabel("default") {
+		t.Fatalf("labels lost when rotation was skipped: %+v", r)
+	}
+}

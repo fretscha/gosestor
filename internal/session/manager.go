@@ -7,6 +7,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/fretscha/gosestor/internal/store"
@@ -48,6 +51,7 @@ type Live struct {
 	SessionID string
 	OwnerID   int64
 	Cookies   map[string]string
+	Labels    []string // sorted, deduped authorization labels (see SetLabels)
 
 	m         *Manager
 	shas      map[string]string
@@ -158,6 +162,7 @@ func (m *Manager) Resolve(ctx context.Context, keyID string) (*Live, error) {
 	}
 	return &Live{
 		KeyID: keyID, SessionID: sid, OwnerID: sess.OwnerID,
+		Labels:  strings.Fields(sess.Labels),
 		Cookies: cookies, shas: shas, m: m, rotateDue: rotateDue,
 	}, nil
 }
@@ -216,6 +221,66 @@ func (l *Live) ForceRotate(ctx context.Context) error {
 		return err
 	}
 	return l.rotateKey(ctx, ttl)
+}
+
+// normalizeLabels sorts, dedupes, and drops empty entries, returning the
+// canonical space-joined form stored in the session.
+func normalizeLabels(labels []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range labels {
+		l = strings.TrimSpace(l)
+		if l == "" || seen[l] {
+			continue
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
+}
+
+// HasLabel reports whether the session's label set contains label.
+func (l *Live) HasLabel(label string) bool {
+	return slices.Contains(l.Labels, label)
+}
+
+// SetLabels REPLACES the session's label set (grant and downgrade are the
+// same symmetric operation) and rotates the KEY_ID when the set changed — a
+// label change is a same-owner privilege change, exactly what OWASP's
+// renew-on-privilege-change covers. The rotation is skipped when this
+// response already carries a fresh key (rewrite pending): labels still
+// persist, only the redundant second swap is elided. Persistence ordering
+// matches every other rotation: session (labels + LastRotation) FIRST, key
+// swap last, so a partial failure leaves the client's old key valid.
+func (l *Live) SetLabels(ctx context.Context, labels []string) (bool, error) {
+	norm := normalizeLabels(labels)
+	if norm == strings.Join(l.Labels, " ") {
+		return false, nil
+	}
+	now := l.m.clock.Now().Unix()
+	sess, err := l.m.store.GetSession(ctx, l.SessionID)
+	if err != nil {
+		return false, err
+	}
+	sess.Labels = norm
+	sess.LastAccess = now
+	rotate := !l.rewrite
+	if rotate {
+		sess.LastRotation = now // this rotation also resets the periodic clock
+	}
+	ttl := l.m.ttl(sess, now)
+	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
+		return false, err
+	}
+	l.Labels = strings.Fields(norm)
+	if !rotate {
+		return true, nil
+	}
+	if err := l.rotateKey(ctx, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // expired reports whether the session is past its inactive or final limit.
