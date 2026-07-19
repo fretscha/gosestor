@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -511,6 +512,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return nil
 }
 
+// splitLabels tokenizes a labels header value on commas and whitespace.
+func splitLabels(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
+}
+
 // prepareUpstreamCookies rewrites the inbound Cookie header the backend will
 // see. It removes (a) the opaque proxy cookie — the KEY_ID must never cross the
 // proxy boundary — and (b) any client-supplied cookie whose name the plugin
@@ -650,6 +656,7 @@ func (ic *interceptor) ensureProcessed() {
 		h.Del("Set-Cookie")
 		h.Del(ic.h.IdentityHeader)
 		h.Del(ic.h.rotateHeaderName)
+		h.Del(ic.h.labelsHeaderName)
 		fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
 		if ic.live != nil {
 			fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
@@ -715,6 +722,34 @@ func (ic *interceptor) processLocked() error {
 				zap.String("op", "response"), zap.String("value", rawRotate))
 		}
 		rotateRequested = err == nil && want
+	}
+
+	// (5c) Label grants: header presence (even empty) REPLACES the session's
+	// label set; absence changes nothing. Stripped unconditionally so backend
+	// grants never reach the client. The reserved "anonymous" label is a
+	// sentinel, not a privilege — grants naming it are dropped with a warning.
+	rawLabels := hdr.Values(ic.h.labelsHeaderName)
+	hdr.Del(ic.h.labelsHeaderName)
+	if len(rawLabels) > 0 {
+		labels := splitLabels(strings.Join(rawLabels, ","))
+		kept := labels[:0]
+		for _, lab := range labels {
+			if lab == authz.Anonymous {
+				ic.h.logger.Warn("ignoring reserved label in grant", zap.String("label", lab))
+				continue
+			}
+			kept = append(kept, lab)
+		}
+		// Don't mint a session just to hold an empty set — an empty grant to
+		// a session-less client is a no-op, not a session.
+		if ic.live != nil || len(kept) > 0 {
+			if err := ic.ensureLive(); err != nil {
+				return err
+			}
+			if _, err := ic.live.SetLabels(ic.ctx, kept); err != nil {
+				return err
+			}
+		}
 	}
 
 	// (6) Filter each captured Set-Cookie: forward / store / drop.

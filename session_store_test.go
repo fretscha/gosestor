@@ -850,3 +850,167 @@ func TestAuthzFailsClosedUnderFailOpen(t *testing.T) {
 		t.Fatal("fail_open must still proxy anonymous paths with the store down")
 	}
 }
+
+// TestLabelsGrantStoresRotatesAndStrips: a grant on an established session
+// replaces the set, rotates the proxy cookie (privilege change), and the
+// header never reaches the client.
+func TestLabelsGrantStoresRotatesAndStrips(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newAuthzTestHandler(t, clk)
+	live, _ := mgr.Begin(ctx)
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Labels", "default, adm")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rec.Result().Header.Get("X-Session-Labels"); got != "" {
+		t.Fatalf("labels header leaked to client: %q", got)
+	}
+	var newKey string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			newKey = c.Value
+		}
+	}
+	if newKey == "" || newKey == key {
+		t.Fatalf("grant must rotate the proxy cookie, got %q", newKey)
+	}
+	r, _ := mgr.Resolve(ctx, newKey)
+	if r == nil || !r.HasLabel("adm") || !r.HasLabel("default") {
+		t.Fatalf("labels not stored: %+v", r)
+	}
+	if old, _ := mgr.Resolve(ctx, key); old != nil {
+		t.Fatal("old key survived a grant rotation")
+	}
+}
+
+// TestLabelsGrantMintsSession: a grant on a session-less response mints a
+// session to hold it — the backend said this client is something; that
+// statement needs a session to live in.
+func TestLabelsGrantMintsSession(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newAuthzTestHandler(t, clk)
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil) // no cookie
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Labels", "default")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			key = c.Value
+		}
+	}
+	if key == "" {
+		t.Fatal("no session minted for a label grant")
+	}
+	if r, _ := mgr.Resolve(ctx, key); r == nil || !r.HasLabel("default") {
+		t.Fatalf("minted session lacks granted label: %+v", r)
+	}
+}
+
+// TestLabelsEmptyGrantWithoutSessionMintsNothing: clearing labels on a
+// session-less response is a no-op, not a session — otherwise a backend that
+// clears on every response would inflate Redis with empty sessions.
+func TestLabelsEmptyGrantWithoutSessionMintsNothing(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newAuthzTestHandler(t, clk)
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Labels", "")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if scs := rec.Result().Header["Set-Cookie"]; len(scs) != 0 {
+		t.Fatalf("empty grant minted a session: %v", scs)
+	}
+	if got := rec.Result().Header.Get("X-Session-Labels"); got != "" {
+		t.Fatalf("labels header leaked: %q", got)
+	}
+}
+
+// TestLabelsAnonymousGrantIgnored: "anonymous" is the no-auth sentinel, not a
+// privilege — a grant naming it keeps the rest and drops it with a warning.
+func TestLabelsAnonymousGrantIgnored(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newAuthzTestHandler(t, clk)
+	live, _ := mgr.Begin(ctx)
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/auth/login", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("X-Session-Labels", "anonymous default")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	var newKey string
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			newKey = c.Value
+		}
+	}
+	r, _ := mgr.Resolve(ctx, newKey)
+	if r == nil || !r.HasLabel("default") || r.HasLabel("anonymous") {
+		t.Fatalf("anonymous slipped into the label set: %+v", r)
+	}
+}
+
+// TestLabelsHeaderAbsentNoChange: a response without the header leaves the
+// set untouched and triggers no rotation.
+func TestLabelsHeaderAbsentNoChange(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newAuthzTestHandler(t, clk)
+	live, _ := mgr.Begin(ctx)
+	if _, err := live.SetLabels(ctx, []string{"default"}); err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "__gosestor" {
+			t.Fatalf("absent header caused a rotation: %q", c.Value)
+		}
+	}
+	if r, _ := mgr.Resolve(ctx, key); r == nil || !r.HasLabel("default") {
+		t.Fatalf("labels changed without a header: %+v", r)
+	}
+}
