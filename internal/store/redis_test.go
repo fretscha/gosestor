@@ -78,3 +78,124 @@ func TestRedisDeleteKeyPrunesReverseSet(t *testing.T) {
 		t.Fatalf("reverse set kept deleted key: %v", members)
 	}
 }
+
+func TestRedisReassignOwnerFailureLeavesSessionAndIndexesUnchanged(t *testing.T) {
+	ctx := context.Background()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := NewRedis(client, "gs:")
+	original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+	if err := r.PutSession(ctx, original, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddOwnerIndex(ctx, 41, "sid", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, "gs:owner:42", "wrong type", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	updated := original
+	updated.OwnerID = 42
+	if err := r.ReassignOwner(ctx, updated, time.Hour, time.Hour); err == nil {
+		t.Fatal("ReassignOwner succeeded with a wrong-typed destination index")
+	}
+	got, err := r.GetSession(ctx, "sid")
+	if err != nil || got.OwnerID != 41 {
+		t.Fatalf("failed transition changed session: %+v, %v", got, err)
+	}
+	sids, err := r.OwnerSessions(ctx, 41)
+	if err != nil || len(sids) != 1 || sids[0] != "sid" {
+		t.Fatalf("failed transition changed old index: %v, %v", sids, err)
+	}
+	if err := client.Del(ctx, "gs:owner:42").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReassignOwner(ctx, updated, time.Hour, time.Hour); err != nil {
+		t.Fatalf("retry did not repair transition: %v", err)
+	}
+}
+
+func TestRedisReassignOwnerOldIndexFailureLeavesSessionAndNewIndexUnchanged(t *testing.T) {
+	ctx := context.Background()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := NewRedis(client, "gs:")
+	original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+	if err := r.PutSession(ctx, original, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// This is the Redis equivalent of the former RemoveOwnerIndex step
+	// failing after PutSession had already succeeded.
+	if err := client.Set(ctx, "gs:owner:41", "wrong type", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	updated := original
+	updated.OwnerID = 42
+	if err := r.ReassignOwner(ctx, updated, time.Hour, time.Hour); err == nil {
+		t.Fatal("ReassignOwner succeeded with a wrong-typed old owner index")
+	}
+	got, err := r.GetSession(ctx, "sid")
+	if err != nil || got.OwnerID != 41 {
+		t.Fatalf("failed transition changed session: %+v, %v", got, err)
+	}
+	newSIDs, err := r.OwnerSessions(ctx, 42)
+	if err != nil || len(newSIDs) != 0 {
+		t.Fatalf("failed transition changed new index: %v, %v", newSIDs, err)
+	}
+	if err := client.Del(ctx, "gs:owner:41").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddOwnerIndex(ctx, 41, "sid", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReassignOwner(ctx, updated, time.Hour, time.Hour); err != nil {
+		t.Fatalf("retry after repairing old index failed: %v", err)
+	}
+}
+
+func TestRedisOwnerIDsAboveFloatPrecisionRemainDistinct(t *testing.T) {
+	ctx := context.Background()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mr.Close)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := NewRedis(client, "gs:")
+	const oldOwner int64 = 9_007_199_254_740_992
+	const newOwner int64 = 9_007_199_254_740_993
+	original := Session{ID: "sid", OwnerID: oldOwner, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+	if err := r.PutSession(ctx, original, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddOwnerIndex(ctx, oldOwner, "sid", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	updated := original
+	updated.OwnerID = newOwner
+	if err := r.ReassignOwner(ctx, updated, time.Hour, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if sids, err := r.OwnerSessions(ctx, oldOwner); err != nil || len(sids) != 0 {
+		t.Fatalf("old large owner index not pruned: sids=%v err=%v", sids, err)
+	}
+	deleted, err := r.DeleteSessionByOwner(ctx, oldOwner, "sid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
+		t.Fatal("adjacent large owner ID deleted reassigned session")
+	}
+	got, err := r.GetSession(ctx, "sid")
+	if err != nil || got.OwnerID != newOwner {
+		t.Fatalf("reassigned large-owner session missing: session=%+v err=%v", got, err)
+	}
+}

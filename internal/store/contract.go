@@ -106,6 +106,109 @@ func RunContract(t *testing.T, newStore func() Store) {
 		}
 	})
 
+	t.Run("owner reassignment refuses a missing session", func(t *testing.T) {
+		s := newStore()
+		sess := Session{ID: "missing", OwnerID: 42, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+		if err := s.ReassignOwner(ctx, sess, time.Hour, time.Hour); err != ErrNotFound {
+			t.Fatalf("ReassignOwner missing session error = %v, want ErrNotFound", err)
+		}
+		if sids, err := s.OwnerSessions(ctx, 42); err != nil || len(sids) != 0 {
+			t.Fatalf("missing session was added to owner index: sids=%v err=%v", sids, err)
+		}
+	})
+
+	t.Run("owner reassignment updates row and indexes atomically", func(t *testing.T) {
+		s := newStore()
+		original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+		if err := s.PutSession(ctx, original, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddOwnerIndex(ctx, 41, "sid", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		updated := original
+		updated.OwnerID = 42
+		updated.LastAccess = 2
+		if err := s.ReassignOwner(ctx, updated, time.Hour, 2*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetSession(ctx, "sid")
+		if err != nil || got.OwnerID != 42 || got.LastAccess != 2 {
+			t.Fatalf("session after reassignment = %+v, %v", got, err)
+		}
+		oldSIDs, err := s.OwnerSessions(ctx, 41)
+		if err != nil || len(oldSIDs) != 0 {
+			t.Fatalf("old owner index = %v, %v", oldSIDs, err)
+		}
+		newSIDs, err := s.OwnerSessions(ctx, 42)
+		if err != nil || len(newSIDs) != 1 || newSIDs[0] != "sid" {
+			t.Fatalf("new owner index = %v, %v", newSIDs, err)
+		}
+	})
+
+	t.Run("owner-conditional delete removes the complete session", func(t *testing.T) {
+		s := newStore()
+		sess := Session{ID: "sid", OwnerID: 42, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+		if err := s.PutSession(ctx, sess, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutKey(ctx, "key", "sid", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutCookie(ctx, "sid", "JSESSIONID", "secret", "sha"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddOwnerIndex(ctx, 42, "sid", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		deleted, err := s.DeleteSessionByOwner(ctx, 42, "sid")
+		if err != nil || !deleted {
+			t.Fatalf("DeleteSessionByOwner = deleted=%v err=%v", deleted, err)
+		}
+		if _, err := s.GetSession(ctx, "sid"); err != ErrNotFound {
+			t.Fatalf("session survived owner delete: %v", err)
+		}
+		if _, err := s.GetKey(ctx, "key"); err != ErrNotFound {
+			t.Fatalf("key survived owner delete: %v", err)
+		}
+		if cookies, err := s.GetCookies(ctx, "sid"); err != nil || len(cookies) != 0 {
+			t.Fatalf("cookies survived owner delete: cookies=%v err=%v", cookies, err)
+		}
+		if shas, err := s.CookieSHAs(ctx, "sid"); err != nil || len(shas) != 0 {
+			t.Fatalf("cookie SHAs survived owner delete: shas=%v err=%v", shas, err)
+		}
+		if sids, err := s.OwnerSessions(ctx, 42); err != nil || len(sids) != 0 {
+			t.Fatalf("owner index survived owner delete: sids=%v err=%v", sids, err)
+		}
+	})
+
+	t.Run("owner-conditional delete preserves reassigned session", func(t *testing.T) {
+		s := newStore()
+		original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+		if err := s.PutSession(ctx, original, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AddOwnerIndex(ctx, 41, "sid", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		updated := original
+		updated.OwnerID = 42
+		if err := s.ReassignOwner(ctx, updated, time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		deleted, err := s.DeleteSessionByOwner(ctx, 41, "sid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deleted {
+			t.Fatal("delete reported a session now owned by someone else")
+		}
+		got, err := s.GetSession(ctx, "sid")
+		if err != nil || got.OwnerID != 42 {
+			t.Fatalf("reassigned session was deleted: %+v, %v", got, err)
+		}
+	})
+
 	t.Run("lock is exclusive then released", func(t *testing.T) {
 		s := newStore()
 		unlock, ok, err := s.Lock(ctx, "sid", time.Minute)

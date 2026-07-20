@@ -144,6 +144,47 @@ func (m *Memory) OwnerSessions(_ context.Context, ownerID int64) ([]string, erro
 	return out, nil
 }
 
+func (m *Memory) ReassignOwner(_ context.Context, s Session, _, _ time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous, ok := m.sessions[s.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if previous.OwnerID > 0 && previous.OwnerID != s.OwnerID {
+		if set := m.owners[previous.OwnerID]; set != nil {
+			delete(set, s.ID)
+		}
+	}
+	m.sessions[s.ID] = s
+	if m.owners[s.OwnerID] == nil {
+		m.owners[s.OwnerID] = map[string]struct{}{}
+	}
+	m.owners[s.OwnerID][s.ID] = struct{}{}
+	return nil
+}
+
+func (m *Memory) DeleteSessionByOwner(_ context.Context, ownerID int64, sessionID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if set := m.owners[ownerID]; set != nil {
+		delete(set, sessionID)
+	}
+	s, ok := m.sessions[sessionID]
+	if !ok || s.OwnerID != ownerID {
+		return false, nil
+	}
+	delete(m.sessions, sessionID)
+	delete(m.cookies, sessionID)
+	delete(m.shas, sessionID)
+	for keyID, sid := range m.keys {
+		if sid == sessionID {
+			delete(m.keys, keyID)
+		}
+	}
+	return true, nil
+}
+
 func (m *Memory) Refresh(_ context.Context, _ string, _ time.Duration) error { return nil }
 
 func (m *Memory) Lock(_ context.Context, sessionID string, _ time.Duration) (func(context.Context) error, bool, error) {

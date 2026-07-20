@@ -162,6 +162,83 @@ func (r *Redis) OwnerSessions(ctx context.Context, ownerID int64) ([]string, err
 	return r.c.SMembers(ctx, r.ownerKey(ownerID)).Result()
 }
 
+const reassignOwnerScript = `
+local function require_type(key, expected)
+  local actual = redis.call("TYPE", key)["ok"]
+  if actual ~= "none" and actual ~= expected then
+    return redis.error_reply("WRONGTYPE " .. key .. " must be " .. expected)
+  end
+end
+local err = require_type(KEYS[1], "hash")
+if err then return err end
+err = require_type(KEYS[2], "set")
+if err then return err end
+if redis.call("EXISTS", KEYS[1]) == 0 then return 0 end
+local previous = redis.call("HGET", KEYS[1], "owner_id") or "0"
+local previous_key = ARGV[11] .. previous
+if previous ~= "0" and previous ~= ARGV[6] then
+  err = require_type(previous_key, "set")
+  if err then return err end
+end
+redis.call("HSET", KEYS[1],
+  "creation", ARGV[1], "last_access", ARGV[2],
+  "inactive_timeout", ARGV[3], "final_timeout", ARGV[4],
+  "owner_id", ARGV[6], "last_rotation", ARGV[7], "labels", ARGV[8])
+if tonumber(ARGV[9]) > 0 then redis.call("PEXPIRE", KEYS[1], ARGV[9]) end
+redis.call("SADD", KEYS[2], ARGV[5])
+if tonumber(ARGV[10]) > 0 then redis.call("PEXPIRE", KEYS[2], ARGV[10]) end
+if previous ~= "0" and previous ~= ARGV[6] then
+  redis.call("SREM", previous_key, ARGV[5])
+end
+return 1
+`
+
+func (r *Redis) ReassignOwner(ctx context.Context, s Session, sessionTTL, ownerIndexTTL time.Duration) error {
+	result, err := r.c.Eval(ctx, reassignOwnerScript,
+		[]string{r.sessKey(s.ID), r.ownerKey(s.OwnerID)},
+		s.Creation, s.LastAccess, s.InactiveTimeout, s.FinalTimeout, s.ID,
+		s.OwnerID, s.LastRotation, s.Labels, sessionTTL.Milliseconds(),
+		ownerIndexTTL.Milliseconds(), r.prefix+"owner:").Int()
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+const deleteSessionByOwnerScript = `
+local function require_type(key, expected)
+  local actual = redis.call("TYPE", key)["ok"]
+  if actual ~= "none" and actual ~= expected then
+    return redis.error_reply("WRONGTYPE " .. key .. " must be " .. expected)
+  end
+end
+local expected = {"hash", "set", "hash", "hash", "set"}
+for i = 1, #expected do
+  local err = require_type(KEYS[i], expected[i])
+  if err then return err end
+end
+local current = redis.call("HGET", KEYS[1], "owner_id") or "0"
+if current ~= ARGV[1] then
+  redis.call("SREM", KEYS[2], ARGV[2])
+  return 0
+end
+local key_ids = redis.call("SMEMBERS", KEYS[5])
+for _, key_id in ipairs(key_ids) do redis.call("DEL", ARGV[3] .. key_id) end
+redis.call("DEL", KEYS[1], KEYS[3], KEYS[4], KEYS[5])
+redis.call("SREM", KEYS[2], ARGV[2])
+return 1
+`
+
+func (r *Redis) DeleteSessionByOwner(ctx context.Context, ownerID int64, sessionID string) (bool, error) {
+	result, err := r.c.Eval(ctx, deleteSessionByOwnerScript,
+		[]string{r.sessKey(sessionID), r.ownerKey(ownerID), r.attrKey(sessionID), r.shaKey(sessionID), r.sessKey(sessionID) + ":keys"},
+		ownerID, sessionID, r.prefix+"key:").Int()
+	return result == 1, err
+}
+
 func (r *Redis) Refresh(ctx context.Context, sessionID string, ttl time.Duration) error {
 	if ttl <= 0 {
 		return nil
