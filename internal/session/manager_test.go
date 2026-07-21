@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -486,6 +487,192 @@ func TestMaybeRotateRechecksStore(t *testing.T) {
 	}
 }
 
+func TestRevokeCurrentSessionDeletesCompleteCascade(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	if _, err := live.BindOwner(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.StoreCookie(ctx, "JSESSIONID", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	secondKey := "second-key"
+	if err := st.PutKey(ctx, secondKey, live.SessionID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	currentKey := live.KeyID
+
+	if err := live.Revoke(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession(ctx, live.SessionID); err != store.ErrNotFound {
+		t.Fatalf("session survived current-session revoke: %v", err)
+	}
+	for _, key := range []string{currentKey, secondKey} {
+		if got, err := m.Resolve(ctx, key); err != nil || got != nil {
+			t.Fatalf("key %q survived current-session revoke: live=%+v err=%v", key, got, err)
+		}
+	}
+	if cookies, _ := st.GetCookies(ctx, live.SessionID); len(cookies) != 0 {
+		t.Fatalf("cookies survived current-session revoke: %v", cookies)
+	}
+	if shas, _ := st.CookieSHAs(ctx, live.SessionID); len(shas) != 0 {
+		t.Fatalf("cookie SHAs survived current-session revoke: %v", shas)
+	}
+	if sids, _ := st.OwnerSessions(ctx, 7); len(sids) != 0 {
+		t.Fatalf("owner index survived current-session revoke: %v", sids)
+	}
+}
+
+type updateBlockingStore struct {
+	store.Store
+	entered chan struct{}
+	resume  chan struct{}
+	block   bool
+}
+
+func (s *updateBlockingStore) TouchSession(ctx context.Context, id, keyID string, lastAccess, legacyRotation int64, ttl time.Duration) error {
+	if s.block {
+		s.block = false
+		close(s.entered)
+		<-s.resume
+	}
+	return s.Store.TouchSession(ctx, id, keyID, lastAccess, legacyRotation, ttl)
+}
+
+func TestStaleLiveOwnerCannotMutateAfterConcurrentRotation(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	if _, err := live.BindOwner(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := m.Resolve(ctx, live.KeyID)
+	if err != nil || stale == nil {
+		t.Fatalf("resolve stale handle: live=%+v err=%v", stale, err)
+	}
+	if _, err := live.BindOwner(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := stale.BindOwner(ctx, 1); !errors.Is(err, store.ErrConflict) || changed {
+		t.Fatalf("stale owner mutation: changed=%v err=%v, want conflict", changed, err)
+	}
+	got, err := st.GetSession(ctx, live.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OwnerID != 2 {
+		t.Fatalf("stale response changed owner: got %d, want 2", got.OwnerID)
+	}
+}
+
+func TestStaleLiveLabelsCannotMutateAfterConcurrentRotation(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	if _, err := live.SetLabels(ctx, []string{"default"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := m.Resolve(ctx, live.KeyID)
+	if err != nil || current == nil {
+		t.Fatalf("resolve current handle: live=%+v err=%v", current, err)
+	}
+	stale, err := m.Resolve(ctx, live.KeyID)
+	if err != nil || stale == nil {
+		t.Fatalf("resolve stale handle: live=%+v err=%v", stale, err)
+	}
+	if _, err := current.SetLabels(ctx, []string{"adm"}); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := stale.SetLabels(ctx, []string{"default"}); !errors.Is(err, store.ErrConflict) || changed {
+		t.Fatalf("stale label mutation: changed=%v err=%v, want conflict", changed, err)
+	}
+	got, err := st.GetSession(ctx, live.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Labels != "adm" {
+		t.Fatalf("stale response changed labels: got %q, want adm", got.Labels)
+	}
+}
+
+func TestResolveTouchCannotRevertConcurrentOwnerTransition(t *testing.T) {
+	ctx := context.Background()
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	base := store.NewMemory()
+	wrapped := &updateBlockingStore{Store: base, entered: make(chan struct{}), resume: make(chan struct{})}
+	m := NewManager(wrapped, clk, Config{Inactive: time.Hour, Final: 24 * time.Hour}, nil)
+	live, err := m.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped.block = true
+	resolved := make(chan error, 1)
+	go func() {
+		_, err := m.Resolve(ctx, live.KeyID)
+		resolved <- err
+	}()
+	<-wrapped.entered
+	if _, err := live.BindOwner(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	close(wrapped.resume)
+	if err := <-resolved; err != nil {
+		t.Fatal(err)
+	}
+	got, err := base.GetSession(ctx, live.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OwnerID != 2 {
+		t.Fatalf("stale Resolve reverted owner to %d, want 2", got.OwnerID)
+	}
+	if old, _ := base.OwnerSessions(ctx, 1); len(old) != 0 {
+		t.Fatalf("old owner index survived: %v", old)
+	}
+	if current, _ := base.OwnerSessions(ctx, 2); !slices.Contains(current, live.SessionID) {
+		t.Fatalf("new owner index lost session: %v", current)
+	}
+}
+
+func TestStaleLiveCannotMutateRevokedSession(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	key := live.KeyID
+	stale, err := m.Resolve(ctx, key)
+	if err != nil || stale == nil {
+		t.Fatalf("resolve stale handle: live=%+v err=%v", stale, err)
+	}
+	if err := live.Revoke(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.StoreCookie(ctx, "JSESSIONID", "recreated"); err != store.ErrNotFound {
+		t.Fatalf("stale cookie write err = %v, want ErrNotFound", err)
+	}
+	if err := stale.ForceRotate(ctx); err != store.ErrNotFound {
+		t.Fatalf("stale rotation err = %v, want ErrNotFound", err)
+	}
+	if _, err := stale.SetLabels(ctx, []string{"adm"}); err != store.ErrNotFound {
+		t.Fatalf("stale label write err = %v, want ErrNotFound", err)
+	}
+	if _, err := st.GetSession(ctx, live.SessionID); err != store.ErrNotFound {
+		t.Fatalf("stale response recreated session: %v", err)
+	}
+	if cookies, _ := st.GetCookies(ctx, live.SessionID); len(cookies) != 0 {
+		t.Fatalf("stale response created orphan cookies: %v", cookies)
+	}
+}
+
 func TestRevokeOwnerKillsAllSessions(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	m, st := newTestManager(clk)
@@ -542,19 +729,19 @@ type failReassignStore struct {
 	fail bool
 }
 
-func (s *failReassignStore) ReassignOwner(ctx context.Context, sess store.Session, sessionTTL, ownerIndexTTL time.Duration) error {
-	if s.fail {
+func (s *failReassignStore) ApplySessionControls(ctx context.Context, sessionID string, controls store.SessionControls, sessionTTL, ownerIndexTTL time.Duration) error {
+	if s.fail && controls.SetOwner {
 		s.fail = false
 		return errors.New("injected owner transition failure")
 	}
-	return s.Store.ReassignOwner(ctx, sess, sessionTTL, ownerIndexTTL)
+	return s.Store.ApplySessionControls(ctx, sessionID, controls, sessionTTL, ownerIndexTTL)
 }
 
 func TestBindOwnerAtomicFailureCanBeRetried(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	mem := store.NewMemory()
 	failing := &failReassignStore{Store: mem}
-	m := NewManager(failing, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: false}, fixedRand())
+	m := NewManager(failing, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: true}, fixedRand())
 	ctx := context.Background()
 	live, err := m.Begin(ctx)
 	if err != nil {
@@ -563,6 +750,7 @@ func TestBindOwnerAtomicFailureCanBeRetried(t *testing.T) {
 	if _, err := live.BindOwner(ctx, 41); err != nil {
 		t.Fatal(err)
 	}
+	keyBeforeFailure := live.KeyID
 	failing.fail = true
 	if _, err := live.BindOwner(ctx, 42); err == nil {
 		t.Fatal("BindOwner succeeded despite injected atomic transition failure")
@@ -570,6 +758,9 @@ func TestBindOwnerAtomicFailureCanBeRetried(t *testing.T) {
 	got, err := mem.GetSession(ctx, live.SessionID)
 	if err != nil || got.OwnerID != 41 || live.OwnerID != 41 {
 		t.Fatalf("failed transition became persistent: stored=%+v liveOwner=%d err=%v", got, live.OwnerID, err)
+	}
+	if resolved, err := m.Resolve(ctx, keyBeforeFailure); err != nil || resolved == nil {
+		t.Fatalf("failed transition did not roll back key swap: live=%+v err=%v", resolved, err)
 	}
 	if _, err := live.BindOwner(ctx, 42); err != nil {
 		t.Fatalf("retry failed: %v", err)
@@ -635,12 +826,59 @@ type reassignBlockingStore struct {
 	resume  chan struct{}
 }
 
-func (s *reassignBlockingStore) ReassignOwner(ctx context.Context, sess store.Session, sessionTTL, ownerIndexTTL time.Duration) error {
-	if s.block {
+func (s *reassignBlockingStore) ApplySessionControls(ctx context.Context, sessionID string, controls store.SessionControls, sessionTTL, ownerIndexTTL time.Duration) error {
+	if s.block && controls.SetOwner {
 		close(s.entered)
 		<-s.resume
 	}
-	return s.Store.ReassignOwner(ctx, sess, sessionTTL, ownerIndexTTL)
+	return s.Store.ApplySessionControls(ctx, sessionID, controls, sessionTTL, ownerIndexTTL)
+}
+
+func TestOwnerTransitionCannotRevertConcurrentLabels(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	mem := store.NewMemory()
+	blocking := &reassignBlockingStore{Store: mem, entered: make(chan struct{}), resume: make(chan struct{})}
+	m := NewManager(blocking, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: false}, fixedRand())
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	if _, err := live.BindOwner(ctx, 41); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.SetLabels(ctx, []string{"default"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed := live.NewProxyCookie(); !changed {
+		t.Fatal("expected initial proxy cookie")
+	}
+	stale, err := m.Resolve(ctx, live.KeyID)
+	if err != nil || stale == nil {
+		t.Fatalf("resolve stale handle: live=%+v err=%v", stale, err)
+	}
+	current, err := m.Resolve(ctx, live.KeyID)
+	if err != nil || current == nil {
+		t.Fatalf("resolve current handle: live=%+v err=%v", current, err)
+	}
+	blocking.block = true
+	bindDone := make(chan error, 1)
+	go func() {
+		_, err := stale.BindOwner(ctx, 42)
+		bindDone <- err
+	}()
+	<-blocking.entered
+	if _, err := current.SetLabels(ctx, []string{"adm"}); err != nil {
+		t.Fatal(err)
+	}
+	close(blocking.resume)
+	if err := <-bindDone; !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale owner transition err = %v, want ErrConflict", err)
+	}
+	got, err := mem.GetSession(ctx, live.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OwnerID != 41 || got.Labels != "adm" {
+		t.Fatalf("stale owner transition partially applied: %+v", got)
+	}
 }
 
 func TestRevokeWinningRacePreventsSessionRecreation(t *testing.T) {
@@ -733,6 +971,70 @@ func TestForceRotateHardDeletesOldKey(t *testing.T) {
 	r, _ := m.Resolve(ctx, newKey)
 	if r == nil || r.Cookies["JSESSIONID"] != "secret" {
 		t.Fatalf("cached cookies lost across forced rotation: %+v", r)
+	}
+}
+
+func TestStaleResponseCannotPersistBackendCookieAfterRotation(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, _ := newTestManager(clk)
+	ctx := context.Background()
+	initial, _ := m.Begin(ctx)
+	winner, _ := m.Resolve(ctx, initial.KeyID)
+	stale, _ := m.Resolve(ctx, initial.KeyID)
+	if err := winner.ApplyResponse(ctx, nil, nil, true, []CookieMutation{{Name: "JSESSIONID", Value: "winner"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.ApplyResponse(ctx, nil, nil, false, []CookieMutation{{Name: "JSESSIONID", Value: "stale"}}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale cookie commit err = %v, want ErrConflict", err)
+	}
+	newKey, _ := winner.NewProxyCookie()
+	resolved, err := m.Resolve(ctx, newKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolved.Cookies["JSESSIONID"]; got != "winner" {
+		t.Fatalf("persisted cookie = %q, want winner", got)
+	}
+}
+
+func TestCompetingForcedRotationsAdmitOneReplacement(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	oldKey := live.KeyID
+	winner, err := m.Resolve(ctx, oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loser, err := m.Resolve(ctx, oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerRotation := clk.Now().Unix()
+	if err := winner.ForceRotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+	if err := loser.ForceRotate(ctx); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("losing rotation err = %v, want ErrConflict", err)
+	}
+	newKey, changed := winner.NewProxyCookie()
+	if !changed || newKey == "" || newKey == oldKey {
+		t.Fatalf("winner did not mint one replacement: %q, changed=%v", newKey, changed)
+	}
+	if got, _ := m.Resolve(ctx, oldKey); got != nil {
+		t.Fatal("old key survived competing rotations")
+	}
+	if got, _ := m.Resolve(ctx, newKey); got == nil {
+		t.Fatal("winning replacement key is invalid")
+	}
+	persisted, err := st.GetSession(ctx, live.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.LastRotation != winnerRotation {
+		t.Fatalf("CAS loser advanced LastRotation: got %d, want %d", persisted.LastRotation, winnerRotation)
 	}
 }
 

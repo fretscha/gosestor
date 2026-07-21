@@ -30,6 +30,12 @@ type Config struct {
 	RotateInterval time.Duration
 }
 
+type CookieMutation struct {
+	Name   string
+	Value  string
+	Delete bool
+}
+
 // Manager owns session/key lifecycle over a Store.
 type Manager struct {
 	store store.Store
@@ -143,13 +149,7 @@ func (m *Manager) Resolve(ctx context.Context, keyID string) (*Live, error) {
 	// Slide the window: update last_access and refresh TTLs.
 	sess.LastAccess = now
 	ttl := m.ttl(sess, now)
-	if err := m.store.PutSession(ctx, sess, ttl); err != nil {
-		return nil, err
-	}
-	if err := m.store.Refresh(ctx, sid, ttl); err != nil {
-		return nil, err
-	}
-	if err := m.store.SetKeyTTL(ctx, keyID, ttl); err != nil {
+	if err := m.store.TouchSession(ctx, sid, keyID, sess.LastAccess, sess.LastRotation, ttl); err != nil {
 		return nil, err
 	}
 	cookies, err := m.store.GetCookies(ctx, sid)
@@ -186,25 +186,17 @@ func (l *Live) MaybeRotate(ctx context.Context) error {
 	if now-sess.LastRotation < int64(l.m.cfg.RotateInterval.Seconds()) {
 		return nil // a concurrent request rotated meanwhile
 	}
-	sess.LastRotation = now
 	ttl := l.m.ttl(sess, now)
-	// LastRotation is persisted BEFORE the key swap: if the swap fails, the
-	// client keeps its still-valid old key and rotation retries next interval.
-	// The reverse order could delete the old key and then fail before the new
-	// cookie is emitted, stranding the client.
-	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
-		return err
-	}
-	return l.rotateKey(ctx, ttl)
+	return l.rotateKey(ctx, ttl, now)
 }
 
 // ForceRotate executes a backend-requested rotation (step-up re-auth,
 // suspicious account, …). Like MaybeRotate it must run on the response path,
-// under the per-session lock when synchronize_sessions is on. LastRotation is
-// persisted BEFORE the key swap — on a partial failure the client keeps its
-// still-valid old key — and the swap hard-deletes the old key: every backend
-// trigger is security-motivated, so the pre-trigger key must not keep
-// resolving to the now-elevated session. Setting LastRotation also resets the
+// under the per-session lock when synchronize_sessions is on. The timestamp,
+// key mapping, reverse set, and cascade TTLs change in one atomic store
+// transition, so a CAS loser changes nothing. The swap hard-deletes the old
+// key: every backend trigger is security-motivated, so the pre-trigger key must
+// not keep resolving to the now-elevated session. LastRotation also resets the
 // periodic clock, so an interval rotation never immediately follows.
 func (l *Live) ForceRotate(ctx context.Context) error {
 	if l.rewrite {
@@ -215,12 +207,8 @@ func (l *Live) ForceRotate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	sess.LastRotation = now
 	ttl := l.m.ttl(sess, now)
-	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
-		return err
-	}
-	return l.rotateKey(ctx, ttl)
+	return l.rotateKey(ctx, ttl, now)
 }
 
 // normalizeLabels sorts, dedupes, and drops empty entries, returning the
@@ -245,42 +233,110 @@ func (l *Live) HasLabel(label string) bool {
 	return slices.Contains(l.Labels, label)
 }
 
-// SetLabels REPLACES the session's label set (grant and downgrade are the
-// same symmetric operation) and rotates the KEY_ID when the set changed — a
-// label change is a same-owner privilege change, exactly what OWASP's
-// renew-on-privilege-change covers. The rotation is skipped when this
-// response already carries a fresh key (rewrite pending): labels still
-// persist, only the redundant second swap is elided. Persistence ordering
-// matches every other rotation: session (labels + LastRotation) FIRST, key
-// swap last, so a partial failure leaves the client's old key valid.
+// SetLabels REPLACES the session's label set and atomically rotates the key
+// when the set changed. A stale handle that lost the old-key CAS changes
+// nothing.
 func (l *Live) SetLabels(ctx context.Context, labels []string) (bool, error) {
-	norm := normalizeLabels(labels)
-	if norm == strings.Join(l.Labels, " ") {
-		return false, nil
-	}
-	now := l.m.clock.Now().Unix()
 	sess, err := l.m.store.GetSession(ctx, l.SessionID)
 	if err != nil {
 		return false, err
 	}
-	sess.Labels = norm
-	sess.LastAccess = now
-	rotate := !l.rewrite
-	if rotate {
-		sess.LastRotation = now // this rotation also resets the periodic clock
+	changed := normalizeLabels(labels) != sess.Labels
+	if err := l.applyControls(ctx, nil, &labels, false, false, nil); err != nil {
+		return false, err
 	}
+	return changed, nil
+}
+
+// ApplyResponseControls commits owner, label, and rotation decisions for one
+// backend response in a single store transition.
+func (l *Live) ApplyResponseControls(ctx context.Context, ownerID *int64, labels *[]string, forceRotate bool) error {
+	return l.applyControls(ctx, ownerID, labels, forceRotate, true, nil)
+}
+
+// ApplyResponse adds backend cookie writes/deletes to that same old-key-CAS
+// transition so a stale response cannot mutate the winner's authentication state.
+func (l *Live) ApplyResponse(ctx context.Context, ownerID *int64, labels *[]string, forceRotate bool, cookies []CookieMutation) error {
+	return l.applyControls(ctx, ownerID, labels, forceRotate, true, cookies)
+}
+
+func (l *Live) applyControls(ctx context.Context, ownerID *int64, labels *[]string, forceRotate, checkPeriodic bool, cookies []CookieMutation) error {
+	now := l.m.clock.Now().Unix()
+	sess, err := l.m.store.GetSession(ctx, l.SessionID)
+	if err != nil {
+		return err
+	}
+	controls := store.SessionControls{OldKeyID: l.KeyID}
+	ownerChanged := ownerID != nil && *ownerID != sess.OwnerID
+	if ownerID != nil {
+		controls.SetOwner = ownerChanged
+		controls.OwnerID = *ownerID
+	}
+	var normalizedLabels string
+	labelsChanged := false
+	if labels != nil {
+		normalizedLabels = normalizeLabels(*labels)
+		labelsChanged = normalizedLabels != sess.Labels
+		controls.SetLabels = labelsChanged
+		controls.Labels = normalizedLabels
+	}
+	for _, cookie := range cookies {
+		mutation := store.CookieMutation{Name: cookie.Name, Value: cookie.Value, Delete: cookie.Delete}
+		if !cookie.Delete {
+			sum := sha256.Sum256([]byte(cookie.Value))
+			mutation.SHA = base64.RawURLEncoding.EncodeToString(sum[:])
+		}
+		controls.Cookies = append(controls.Cookies, mutation)
+	}
+	due := checkPeriodic && l.m.cfg.RotateInterval > 0 && now-sess.LastRotation >= int64(l.m.cfg.RotateInterval.Seconds())
+	controls.Rotate = !l.rewrite && (forceRotate || due || labelsChanged || (ownerChanged && l.m.cfg.RotateOnLogin))
+	if !controls.SetOwner && !controls.SetLabels && !controls.Rotate && len(controls.Cookies) == 0 {
+		if ownerID != nil {
+			l.OwnerID = *ownerID
+		}
+		if labels != nil {
+			l.Labels = strings.Fields(normalizedLabels)
+		}
+		return nil
+	}
+	if controls.SetOwner || controls.SetLabels || len(controls.Cookies) > 0 {
+		controls.LastAccess = now
+	}
+	if controls.Rotate {
+		controls.LastRotation = now
+		controls.NewKeyID, err = l.m.newID()
+		if err != nil {
+			return err
+		}
+	} else {
+		controls.NewKeyID = l.KeyID
+	}
+	sess.LastAccess = max(sess.LastAccess, controls.LastAccess)
 	ttl := l.m.ttl(sess, now)
-	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
-		return false, err
+	if err := l.m.store.ApplySessionControls(ctx, l.SessionID, controls, ttl, time.Duration(sess.FinalTimeout)*time.Second); err != nil {
+		return err
 	}
-	l.Labels = strings.Fields(norm)
-	if !rotate {
-		return true, nil
+	if ownerID != nil {
+		l.OwnerID = *ownerID
 	}
-	if err := l.rotateKey(ctx, ttl); err != nil {
-		return false, err
+	if labels != nil {
+		l.Labels = strings.Fields(normalizedLabels)
 	}
-	return true, nil
+	for _, cookie := range controls.Cookies {
+		if cookie.Delete {
+			delete(l.Cookies, cookie.Name)
+			delete(l.shas, cookie.Name)
+		} else {
+			l.Cookies[cookie.Name] = cookie.Value
+			l.shas[cookie.Name] = cookie.SHA
+		}
+	}
+	if controls.Rotate {
+		l.KeyID = controls.NewKeyID
+		l.newKey = controls.NewKeyID
+		l.rewrite = true
+	}
+	return nil
 }
 
 // expired reports whether the session is past its inactive or final limit.
@@ -317,61 +373,42 @@ func (l *Live) NewProxyCookie() (string, bool) {
 // The write is never skipped from local state because a concurrent response may
 // have deleted the persisted value after this Live handle was resolved.
 func (l *Live) StoreCookie(ctx context.Context, name, value string) error {
-	sum := sha256.Sum256([]byte(value))
-	sha := base64.RawURLEncoding.EncodeToString(sum[:])
-	// Always persist an explicit backend Set-Cookie. This Live handle may have
-	// been resolved before a concurrent response deleted the same value, so its
-	// local SHA is not authoritative even when it matches.
-	if err := l.m.store.PutCookie(ctx, l.SessionID, name, value, sha); err != nil {
-		return err
-	}
-	l.Cookies[name] = value
-	l.shas[name] = sha
-	return nil
+	return l.applyControls(ctx, nil, nil, false, false, []CookieMutation{{Name: name, Value: value}})
 }
 
 // DeleteCookie removes a cached backend cookie and its change-detection hash.
 func (l *Live) DeleteCookie(ctx context.Context, name string) error {
-	if err := l.m.store.DeleteCookie(ctx, l.SessionID, name); err != nil {
-		return err
-	}
-	delete(l.Cookies, name)
-	delete(l.shas, name)
-	return nil
+	return l.applyControls(ctx, nil, nil, false, false, []CookieMutation{{Name: name, Delete: true}})
 }
 
 // BindOwner sets OWNER_ID when it changes and rotates the KEY_ID on that
 // transition (fixation defense, gated by RotateOnLogin). No-op when ownerID
-// equals the current owner or is non-positive: 0 is the anonymous sentinel and
-// negatives are invalid, and neither may ever reach the owner index — the
-// delete-time pruning skips owner 0, so an indexed 0-set could never shrink.
+// equals the current persisted owner or is non-positive: 0 is the anonymous
+// sentinel and negatives are invalid, and neither may ever reach the owner
+// index — the delete-time pruning skips owner 0, so an indexed 0-set could
+// never shrink.
 func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
-	if ownerID <= 0 || ownerID == l.OwnerID {
+	if ownerID <= 0 {
 		return false, nil
 	}
-	now := l.m.clock.Now().Unix()
 	sess, err := l.m.store.GetSession(ctx, l.SessionID)
 	if err != nil {
 		return false, err
 	}
-	sess.OwnerID = ownerID
-	sess.LastAccess = now
-	if l.m.cfg.RotateOnLogin {
-		sess.LastRotation = now // the fixation rotation below also resets the periodic clock
+	changed := ownerID != sess.OwnerID
+	// BindOwner's standalone API preserves its historical guarantee that an
+	// owner transition rotates even when Begin has a not-yet-emitted key. The
+	// response pipeline combines creation and controls and avoids this churn.
+	wasRewrite, pendingKey := l.rewrite, l.newKey
+	if changed && l.m.cfg.RotateOnLogin && l.rewrite {
+		l.rewrite = false
+		l.newKey = ""
 	}
-	ttl := l.m.ttl(sess, now)
-	if err := l.m.store.ReassignOwner(ctx, sess, ttl, time.Duration(sess.FinalTimeout)*time.Second); err != nil {
+	if err := l.applyControls(ctx, &ownerID, nil, false, false, nil); err != nil {
+		l.rewrite, l.newKey = wasRewrite, pendingKey
 		return false, err
 	}
-	l.OwnerID = ownerID
-	if !l.m.cfg.RotateOnLogin {
-		return false, nil
-	}
-	// Rotate the KEY_ID on the identity transition (session-fixation defense).
-	if err := l.rotateKey(ctx, ttl); err != nil {
-		return false, err
-	}
-	return true, nil
+	return changed && l.m.cfg.RotateOnLogin, nil
 }
 
 // rotateKey mints a fresh KEY_ID, persists it, and hard-deletes the current one,
@@ -382,21 +419,33 @@ func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
 // window on use — so a graced key would defeat the fixation defense: an attacker
 // who fixated a pre-auth KEY_ID could use it after login (within grace) to gain
 // authenticated access and renew it indefinitely. Deleting it closes that window.
-func (l *Live) rotateKey(ctx context.Context, ttl time.Duration) error {
+func (l *Live) rotateKey(ctx context.Context, ttl time.Duration, lastRotation int64) error {
 	newKey, err := l.m.newID()
 	if err != nil {
 		return err
 	}
-	// PutKey before DeleteKey: on a partial store failure the new key is orphaned but is never issued to the client.
-	if err := l.m.store.PutKey(ctx, newKey, l.SessionID, ttl); err != nil {
-		return err
-	}
-	if err := l.m.store.DeleteKey(ctx, l.KeyID); err != nil {
+	// Timestamp, key CAS, reverse-set update, and cascade TTL refresh are one
+	// store transition. A concurrent loser cannot partially advance state.
+	if err := l.m.store.RotateSessionKey(ctx, l.SessionID, l.KeyID, newKey, lastRotation, ttl); err != nil {
 		return err
 	}
 	l.KeyID = newKey
 	l.newKey = newKey
 	l.rewrite = true
+	return nil
+}
+
+// Revoke deletes this session and its complete store cascade: every key,
+// cached cookie/hash, and owner-index membership.
+func (l *Live) Revoke(ctx context.Context) error {
+	if err := l.m.store.DeleteSession(ctx, l.SessionID); err != nil {
+		return err
+	}
+	l.KeyID = ""
+	l.newKey = ""
+	l.rewrite = false
+	clear(l.Cookies)
+	clear(l.shas)
 	return nil
 }
 

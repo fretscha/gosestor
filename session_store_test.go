@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -48,8 +52,11 @@ func newRotationTestHandler(clk session.Clock) (*Handler, *session.Manager, *sto
 		store:            st,
 		filter:           filter.New(nil, []string{"JSESSIONID"}),
 		logger:           zap.NewNop(),
-		rotateHeaderName: "X-Session-Rotate",
+		rotateHeaderName: defaultRotateHeader,
 		rotateEnabled:    true,
+		revokeHeaderName: defaultRevokeHeader,
+		revokeEnabled:    true,
+		labelsHeaderName: defaultLabelsHeader,
 	}
 	return h, mgr, st
 }
@@ -75,6 +82,15 @@ func TestUpstreamErrorAtRotationBoundaryKeepsOldKey(t *testing.T) {
 	req.Header.Set("Cookie", "__gosestor="+key)
 	rec := httptest.NewRecorder()
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Add("Set-Cookie", "JSESSIONID=must-not-leak; Path=/")
+		w.Header().Set("X-Auth-User", "42")
+		w.Header().Set(defaultRotateHeader, "1")
+		w.Header().Set(defaultRevokeHeader, "1")
+		w.Header().Set(defaultLabelsHeader, "adm")
+		w.Header().Set("X-Backend-Secret", "must-not-leak")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("must-not-leak"))
+		w.(http.Flusher).Flush()
 		return fmt.Errorf("backend blew up")
 	})
 	if err := h.ServeHTTP(rec, req, next); err == nil {
@@ -84,6 +100,14 @@ func TestUpstreamErrorAtRotationBoundaryKeepsOldKey(t *testing.T) {
 	// The client still holds `key` and never saw a replacement — it must resolve.
 	if got, err := mgr.Resolve(ctx, key); err != nil || got == nil {
 		t.Fatalf("old key stranded after failed request at rotation boundary: got=%+v err=%v", got, err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("downstream error leaked staged body: %q", rec.Body.String())
+	}
+	for _, name := range []string{"Set-Cookie", "X-Auth-User", defaultRotateHeader, defaultRevokeHeader, defaultLabelsHeader, "X-Backend-Secret"} {
+		if got := rec.Header().Values(name); len(got) != 0 {
+			t.Fatalf("downstream error leaked %s: %v", name, got)
+		}
 	}
 }
 
@@ -147,6 +171,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		inactive_timeout 30m
 		final_timeout 8h
 		identity_header X-Auth-User
+		revoke_header X-Revoke-Now
 		synchronize_sessions false
 		on_store_error fail_closed
 	}`
@@ -167,6 +192,9 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if h.IdentityHeader != "X-Auth-User" {
 		t.Errorf("identity header = %q", h.IdentityHeader)
 	}
+	if h.RevokeHeader != "X-Revoke-Now" {
+		t.Errorf("revoke header = %q", h.RevokeHeader)
+	}
 	if h.OnStoreError != "fail_closed" {
 		t.Errorf("on_store_error = %q", h.OnStoreError)
 	}
@@ -175,6 +203,39 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 // TestPrepareUpstreamCookiesStripsManagedAndProxy is the cookie-smuggling
 // regression guard: the client must not be able to send the proxy KEY_ID or a
 // store-managed cookie to the backend; the server-held value is authoritative.
+func TestPrepareUpstreamStripsAllManagedControlHeaders(t *testing.T) {
+	h := &Handler{
+		Cookie:           CookieConfig{Name: "__gosestor"},
+		IdentityHeader:   "X-Auth-User",
+		rotateHeaderName: defaultRotateHeader,
+		revokeHeaderName: defaultRevokeHeader,
+		labelsHeaderName: defaultLabelsHeader,
+		logger:           zap.NewNop(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Trailer = make(http.Header)
+	managed := []string{h.IdentityHeader, h.rotateHeaderName, h.revokeHeaderName, h.labelsHeaderName}
+	for _, name := range managed {
+		req.Header.Set(name, "forged")
+		req.Trailer.Set(name, "forged-trailer")
+	}
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		for _, name := range managed {
+			if got := r.Header.Get(name); got != "" {
+				t.Errorf("managed request header %s reached backend: %q", name, got)
+			}
+			if got := r.Trailer.Get(name); got != "" {
+				t.Errorf("managed request trailer %s reached backend: %q", name, got)
+			}
+		}
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPrepareUpstreamCookiesStripsManagedAndProxy(t *testing.T) {
 	h := &Handler{Cookie: CookieConfig{Name: "__gosestor"}}
 	h.filter = filter.New([]string{"XSRF-TOKEN"}, []string{"JSESSIONID"})
@@ -292,6 +353,142 @@ func TestIdentityTrailerStripped(t *testing.T) {
 	}
 }
 
+type lateTrailerBody struct {
+	trailer http.Header
+	names   []string
+	done    bool
+}
+
+func (b *lateTrailerBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+	b.done = true
+	for _, name := range b.names {
+		b.trailer.Set(name, "forged-late")
+	}
+	p[0] = 'x'
+	return 1, io.EOF
+}
+
+func (*lateTrailerBody) Close() error { return nil }
+
+func TestLateManagedTrailersAreStrippedAfterBodyRead(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	managed := []string{h.IdentityHeader, h.rotateHeaderName, h.revokeHeaderName, h.labelsHeaderName}
+	trailers := make(http.Header)
+	req := httptest.NewRequest(http.MethodPost, "http://x/", nil)
+	req.Trailer = trailers
+	req.Body = &lateTrailerBody{trailer: trailers, names: managed}
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			return err
+		}
+		for _, name := range managed {
+			if got := r.Trailer.Get(name); got != "" {
+				t.Errorf("late managed trailer %s reached backend: %q", name, got)
+			}
+		}
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterceptorPreservesStagedStatusSemantics(t *testing.T) {
+	ic := &interceptor{responseHeader: make(http.Header)}
+	ic.Header().Set("Link", "</style.css>; rel=preload")
+	ic.WriteHeader(http.StatusEarlyHints)
+	if ic.wroteHeader {
+		t.Fatal("informational response became the final response")
+	}
+	ic.WriteHeader(http.StatusCreated)
+	if !ic.wroteHeader || ic.status != http.StatusCreated {
+		t.Fatalf("final status = %d, wrote=%v", ic.status, ic.wroteHeader)
+	}
+	if len(ic.informational) != 1 || ic.informational[0].status != http.StatusEarlyHints {
+		t.Fatalf("informational responses = %+v", ic.informational)
+	}
+
+	for _, status := range []int{http.StatusNoContent, http.StatusNotModified} {
+		bodyless := &interceptor{responseHeader: make(http.Header)}
+		bodyless.WriteHeader(status)
+		if n, err := bodyless.Write([]byte("forbidden")); n != 0 || !errors.Is(err, http.ErrBodyNotAllowed) {
+			t.Fatalf("status %d body write = (%d, %v)", status, n, err)
+		}
+	}
+
+	invalid := &interceptor{responseHeader: make(http.Header)}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("invalid status did not panic")
+		}
+	}()
+	invalid.WriteHeader(42)
+}
+
+func TestStagedBodySpillsToPrivateTemporaryFileAndCleansUp(t *testing.T) {
+	var body stagedBody
+	payload := strings.Repeat("x", stagedResponseMemoryLimit+1)
+	if _, err := body.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if body.file == nil {
+		t.Fatal("response larger than memory limit did not spill")
+	}
+	name := body.file.Name()
+	if info, err := body.file.Stat(); err != nil || info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("staged file permissions are not private: info=%v err=%v", info, err)
+	}
+	var got strings.Builder
+	if err := body.FlushTo(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != payload {
+		t.Fatalf("staged payload mismatch: got %d bytes", got.Len())
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged file remains after close: %v", err)
+	}
+}
+
+func TestLateManagedResponseTrailersAreDiscarded(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		w.Header().Add("Trailer", defaultRevokeHeader+", "+defaultLabelsHeader+", Set-Cookie, X-Trace")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		w.Header().Set(defaultRevokeHeader, "1")
+		w.Header().Set(defaultLabelsHeader, "adm")
+		w.Header().Set("Set-Cookie", "JSESSIONID=late-secret; Path=/")
+		w.Header().Set("X-Trace", "kept")
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{defaultRevokeHeader, defaultLabelsHeader, "Set-Cookie"} {
+		if got := rec.Header().Values(name); len(got) != 0 {
+			t.Fatalf("late managed trailer %s leaked: %v", name, got)
+		}
+	}
+	if got := rec.Header().Get("Trailer"); got != "X-Trace" {
+		t.Fatalf("Trailer declaration = %q, want X-Trace", got)
+	}
+	if got := rec.Header().Get("X-Trace"); got != "kept" {
+		t.Fatalf("unmanaged trailer = %q", got)
+	}
+}
+
 // hijackableRecorder wraps httptest.ResponseRecorder with a Hijack that
 // records the call, standing in for a real hijackable connection.
 type hijackableRecorder struct {
@@ -304,10 +501,10 @@ func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, nil
 }
 
-// TestInterceptorFlushProcessesHeadersFirst: an early Flush (SSE) must run the
-// header pipeline before bytes hit the wire — a store-managed Set-Cookie must
-// already be swallowed, not leaked by the flush.
-func TestInterceptorFlushProcessesHeadersFirst(t *testing.T) {
+// TestInterceptorFlushDefersCommit: an early Flush (SSE) is staged until the
+// downstream handler returns, so a later error can still discard all metadata,
+// body bytes, and session mutations.
+func TestInterceptorFlushDefersCommit(t *testing.T) {
 	clk := &testClock{t: time.Unix(1_000_000, 0)}
 	h, _, _ := newRotationTestHandler(clk)
 
@@ -326,8 +523,11 @@ func TestInterceptorFlushProcessesHeadersFirst(t *testing.T) {
 	if err := h.ServeHTTP(rec, req, next); err != nil {
 		t.Fatal(err)
 	}
-	if !rec.Flushed {
-		t.Fatal("flush was not forwarded to the underlying writer")
+	if rec.Flushed {
+		t.Fatal("flush reached the underlying writer before downstream completion")
+	}
+	if got := rec.Body.String(); got != "data: hi\n\n" {
+		t.Fatalf("body = %q", got)
 	}
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == "JSESSIONID" {
@@ -346,6 +546,9 @@ func TestInterceptorHijackProcessesHeadersFirst(t *testing.T) {
 	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Add("Set-Cookie", "JSESSIONID=secret; Path=/")
+		w.Header().Set("Upgrade", "websocket")
+		w.Header().Set("Connection", "Upgrade")
+		w.WriteHeader(http.StatusSwitchingProtocols)
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			t.Fatal("interceptor does not implement http.Hijacker")
@@ -360,6 +563,12 @@ func TestInterceptorHijackProcessesHeadersFirst(t *testing.T) {
 	}
 	if !rec.hijacked {
 		t.Fatal("hijack was not delegated to the underlying writer")
+	}
+	if rec.Code != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", rec.Code)
+	}
+	if rec.Header().Get("Upgrade") != "websocket" || rec.Header().Get("Connection") != "Upgrade" {
+		t.Fatalf("upgrade handshake headers were not committed: %v", rec.Header())
 	}
 	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
 		for _, sc := range got {
@@ -430,6 +639,27 @@ func TestResolveRotateHeader(t *testing.T) {
 	}
 }
 
+func TestResolveRevokeHeader(t *testing.T) {
+	cases := []struct {
+		name, configured, wantName string
+		wantEnabled                bool
+	}{
+		{"default-on", "", "X-Session-Revoke", true},
+		{"custom-on", "X-Revoke-Now", "X-Revoke-Now", true},
+		{"off-still-strips-default", "off", "X-Session-Revoke", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{RevokeHeader: tc.configured}
+			h.resolveRevokeHeader()
+			if h.revokeHeaderName != tc.wantName || h.revokeEnabled != tc.wantEnabled {
+				t.Fatalf("got (%q, %v), want (%q, %v)",
+					h.revokeHeaderName, h.revokeEnabled, tc.wantName, tc.wantEnabled)
+			}
+		})
+	}
+}
+
 // TestValidateRejectsRotateIdentityCollision: one header carries a boolean,
 // the other an owner id — a shared name would make the backend's value
 // ambiguous and one feature would silently eat the other's header.
@@ -441,6 +671,38 @@ func TestValidateRejectsRotateIdentityCollision(t *testing.T) {
 	}
 	if err := h.Validate(); err == nil {
 		t.Fatal("rotate_header colliding with identity_header must be rejected")
+	}
+}
+
+func TestValidateRejectsRevokeHeaderCollisions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		h    Handler
+	}{
+		{
+			name: "identity",
+			h:    Handler{IdentityHeader: defaultRevokeHeader},
+		},
+		{
+			name: "rotation",
+			h:    Handler{IdentityHeader: "X-Auth-User", RotateHeader: "X-Control", RevokeHeader: "X-Control"},
+		},
+		{
+			name: "labels",
+			h:    Handler{IdentityHeader: "X-Auth-User", LabelsHeader: "X-Control", RevokeHeader: "X-Control"},
+		},
+		{
+			name: "disabled trigger still strips",
+			h:    Handler{IdentityHeader: "X-Auth-User", LabelsHeader: defaultRevokeHeader, RevokeHeader: "off"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.h.Redis.Address = "localhost:6379"
+			tc.h.OnStoreError = "fail_closed"
+			if err := tc.h.Validate(); err == nil {
+				t.Fatal("revoke_header collision must be rejected")
+			}
+		})
 	}
 }
 
@@ -851,6 +1113,271 @@ func TestAuthzFailsClosedUnderFailOpen(t *testing.T) {
 	}
 }
 
+func TestDefaultProxyCookieScopeSurvivesCrossPathLogout(t *testing.T) {
+	h := &Handler{Cookie: CookieConfig{Name: "__gosestor", Insecure: true}}
+	issued := (&http.Response{Header: http.Header{"Set-Cookie": {h.buildProxyCookie("key")}}}).Cookies()
+	if len(issued) != 1 || issued[0].Path != "/" {
+		t.Fatalf("default issuance cookie = %+v, want Path=/", issued)
+	}
+	loginURL, _ := url.Parse("http://example.test/app/login")
+	logoutURL, _ := url.Parse("http://example.test/logout")
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(loginURL, issued)
+	if got := jar.Cookies(logoutURL); len(got) != 1 || got[0].Name != "__gosestor" || got[0].Value != "key" {
+		t.Fatalf("root logout did not receive nested-route cookie: %+v", got)
+	}
+	expired := (&http.Response{Header: http.Header{"Set-Cookie": {h.buildExpiredProxyCookie()}}}).Cookies()
+	if len(expired) != 1 || expired[0].Path != "/" {
+		t.Fatalf("default deletion cookie = %+v, want Path=/", expired)
+	}
+	jar.SetCookies(logoutURL, expired)
+	if got := jar.Cookies(loginURL); len(got) != 0 {
+		t.Fatalf("deletion from /logout left nested-route cookie: %+v", got)
+	}
+}
+
+func TestBuildExpiredProxyCookiePreservesScopeAndSecurity(t *testing.T) {
+	h := &Handler{Cookie: CookieConfig{
+		Name: "__gosestor", Path: "/app", SameSite: "strict", Insecure: false,
+	}}
+	resp := &http.Response{Header: http.Header{"Set-Cookie": {h.buildExpiredProxyCookie()}}}
+	cookies := resp.Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("parsed deletion cookies = %+v", cookies)
+	}
+	got := cookies[0]
+	if got.Name != "__gosestor" || got.Value != "" || got.Path != "/app" ||
+		got.MaxAge >= 0 || !got.HttpOnly || !got.Secure || got.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("unsafe or mismatched deletion cookie: %+v", got)
+	}
+}
+
+// TestRevokeHeaderDeletesCurrentSessionAndExpiresProxyCookie verifies that a
+// backend logout signal wins over all competing response mutations.
+func TestRevokeHeaderDeletesCurrentSessionAndExpiresProxyCookie(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, st := newRotationTestHandler(clk)
+	h.revokeHeaderName = defaultRevokeHeader
+	h.revokeEnabled = true
+	h.labelsHeaderName = defaultLabelsHeader
+	live, err := mgr.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+
+	req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set(defaultRevokeHeader, "1")
+		// Revocation takes precedence over every other response mutation.
+		w.Header().Set("X-Auth-User", "8")
+		w.Header().Set("X-Session-Rotate", "1")
+		w.Header().Set("X-Session-Labels", "adm")
+		w.Header().Add("Set-Cookie", "JSESSIONID=recreated; Path=/")
+		w.Header().Add("Set-Cookie", "XSRF-TOKEN=must-not-leak; Path=/")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	result := rec.Result()
+	for _, name := range []string{defaultRevokeHeader, "X-Auth-User", "X-Session-Rotate", "X-Session-Labels"} {
+		if got := result.Header.Get(name); got != "" {
+			t.Fatalf("managed header %s leaked: %q", name, got)
+		}
+	}
+	var deletion *http.Cookie
+	for _, cookie := range result.Cookies() {
+		if cookie.Name == "__gosestor" {
+			deletion = cookie
+		}
+		if cookie.Name == "JSESSIONID" || cookie.Name == "XSRF-TOKEN" {
+			t.Fatalf("backend cookie leaked during revoke: %+v", cookie)
+		}
+	}
+	if deletion == nil || deletion.Value != "" || deletion.MaxAge >= 0 {
+		t.Fatalf("proxy-cookie deletion missing: cookie=%+v headers=%v", deletion, result.Header.Values("Set-Cookie"))
+	}
+	if got, err := mgr.Resolve(ctx, key); err != nil || got != nil {
+		t.Fatalf("revoked key still resolves: live=%+v err=%v", got, err)
+	}
+	if sids, _ := st.OwnerSessions(ctx, 7); len(sids) != 0 {
+		t.Fatalf("owner index survived revoke: %v", sids)
+	}
+}
+
+func TestRevokeHeaderAnyTruthyFieldValueWins(t *testing.T) {
+	for _, values := range [][]string{{"false", "true"}, {"true", "false"}, {"invalid", "1"}} {
+		t.Run(strings.Join(values, "_then_"), func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, mgr, _ := newRotationTestHandler(clk)
+			live, _ := mgr.Begin(ctx)
+			key := live.KeyID
+			req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+			req.Header.Set("Cookie", "__gosestor="+key)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				for _, value := range values {
+					w.Header().Add(defaultRevokeHeader, value)
+				}
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := mgr.Resolve(ctx, key); err != nil || got != nil {
+				t.Fatalf("truthy revoke field was ignored: live=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestConcurrentStaleResponseCannotReviveRevokedSession(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, st := newRotationTestHandler(clk)
+	h.revokeHeaderName = defaultRevokeHeader
+	h.revokeEnabled = true
+	h.labelsHeaderName = defaultLabelsHeader
+	live, _ := mgr.Begin(ctx)
+	key := live.KeyID
+
+	bEntered := make(chan struct{})
+	releaseB := make(chan struct{})
+	bDone := make(chan error, 1)
+	bRec := httptest.NewRecorder()
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://x/concurrent", nil)
+		req.Header.Set("Cookie", "__gosestor="+key)
+		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			close(bEntered)
+			<-releaseB
+			w.Header().Set("Set-Cookie", "JSESSIONID=must-not-revive; Path=/")
+			w.WriteHeader(http.StatusOK)
+			return nil
+		})
+		bDone <- h.ServeHTTP(bRec, req, next)
+	}()
+	<-bEntered // B resolved the live session before A revokes it.
+
+	aReq := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+	aReq.Header.Set("Cookie", "__gosestor="+key)
+	aRec := httptest.NewRecorder()
+	aNext := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set(defaultRevokeHeader, "1")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(aRec, aReq, aNext); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseB)
+	if err := <-bDone; err != nil {
+		t.Fatal(err)
+	}
+	if bRec.Code != http.StatusBadGateway {
+		t.Fatalf("stale response status = %d, want 502", bRec.Code)
+	}
+	if _, err := st.GetSession(ctx, live.SessionID); err != store.ErrNotFound {
+		t.Fatalf("stale response revived session: %v", err)
+	}
+	if cookies, _ := st.GetCookies(ctx, live.SessionID); len(cookies) != 0 {
+		t.Fatalf("stale response created orphan cookie: %v", cookies)
+	}
+	if got, err := mgr.Resolve(ctx, key); err != nil || got != nil {
+		t.Fatalf("revoked key resolves after stale response: live=%+v err=%v", got, err)
+	}
+}
+
+func TestRevokeHeaderWithoutLiveSessionDoesNotMint(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		proxyCookie string
+		wantDelete  bool
+	}{
+		{name: "anonymous"},
+		{name: "stale proxy cookie", proxyCookie: "missing-key", wantDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, _, _ := newRotationTestHandler(clk)
+			h.revokeHeaderName = defaultRevokeHeader
+			h.revokeEnabled = true
+			req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+			if tc.proxyCookie != "" {
+				req.Header.Set("Cookie", "__gosestor="+tc.proxyCookie)
+			}
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set(defaultRevokeHeader, "true")
+				w.Header().Set("X-Auth-User", "99")
+				w.Header().Add("Set-Cookie", "JSESSIONID=must-not-mint; Path=/")
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			cookies := rec.Result().Cookies()
+			if tc.wantDelete {
+				if len(cookies) != 1 || cookies[0].Name != "__gosestor" || cookies[0].MaxAge >= 0 {
+					t.Fatalf("stale proxy cookie was not expired: %+v", cookies)
+				}
+			} else if len(cookies) != 0 {
+				t.Fatalf("anonymous revoke minted a cookie: %+v", cookies)
+			}
+		})
+	}
+}
+
+func TestRevokeHeaderDisabledFalseOrInvalidOnlyStrips(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		value   string
+	}{
+		{name: "disabled", enabled: false, value: "1"},
+		{name: "false", enabled: true, value: "false"},
+		{name: "invalid", enabled: true, value: "logout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, mgr, _ := newRotationTestHandler(clk)
+			h.revokeHeaderName = defaultRevokeHeader
+			h.revokeEnabled = tc.enabled
+			live, _ := mgr.Begin(ctx)
+			key := live.KeyID
+			req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+			req.Header.Set("Cookie", "__gosestor="+key)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set(defaultRevokeHeader, tc.value)
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			if got := rec.Header().Get(defaultRevokeHeader); got != "" {
+				t.Fatalf("revoke header leaked: %q", got)
+			}
+			if got, err := mgr.Resolve(ctx, key); err != nil || got == nil {
+				t.Fatalf("non-triggering revoke changed session: live=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
 // TestLabelsGrantStoresRotatesAndStrips: a grant on an established session
 // replaces the set, rotates the proxy cookie (privilege change), and the
 // header never reaches the client.
@@ -1077,10 +1604,178 @@ func TestStoredCookieExpiryDeletesAndStopsReinjection(t *testing.T) {
 	}
 }
 
+type revokeFailStore struct{ store.Store }
+
+func (s *revokeFailStore) DeleteSession(context.Context, string) error {
+	return errors.New("revoke failed")
+}
+
+func TestRevokeAfterFailOpenResolveErrorStillFailsClosed(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, st := newRotationTestHandler(clk)
+	broken := errKeyStore{Store: st}
+	h.store = broken
+	h.manager = session.NewManager(broken, clk, session.Config{
+		Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: true,
+	}, nil)
+	h.OnStoreError = "fail_open"
+
+	req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+	req.Header.Set("Cookie", "__gosestor=unresolved-key")
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set(defaultRevokeHeader, "1")
+		w.Header().Set(defaultLabelsHeader, "adm")
+		w.Header().Add("Set-Cookie", "JSESSIONID=must-not-leak; Path=/")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("logout succeeded"))
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadGateway || rec.Body.Len() != 0 {
+		t.Fatalf("unresolved revoke did not fail closed: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("unresolved revoke leaked cookies: %v", got)
+	}
+	for _, name := range []string{defaultRevokeHeader, defaultLabelsHeader} {
+		if got := rec.Header().Get(name); got != "" {
+			t.Fatalf("unresolved revoke leaked %s: %q", name, got)
+		}
+	}
+}
+
+func TestRevokeFailureAlwaysFailsClosedAndScrubs(t *testing.T) {
+	for _, mode := range []string{"fail_open", "fail_closed"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			base := store.NewMemory()
+			failing := &revokeFailStore{Store: base}
+			mgr := session.NewManager(failing, clk, session.Config{
+				Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: true,
+			}, nil)
+			h := &Handler{
+				Cookie:           CookieConfig{Name: "__gosestor"},
+				IdentityHeader:   "X-Auth-User",
+				OnStoreError:     mode,
+				manager:          mgr,
+				store:            failing,
+				filter:           filter.New([]string{"XSRF-TOKEN"}, []string{"JSESSIONID"}),
+				logger:           zap.NewNop(),
+				rotateHeaderName: defaultRotateHeader,
+				rotateEnabled:    true,
+				revokeHeaderName: defaultRevokeHeader,
+				revokeEnabled:    true,
+				labelsHeaderName: defaultLabelsHeader,
+			}
+			live, err := mgr.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := live.KeyID
+			req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+			req.Header.Set("Cookie", "__gosestor="+key)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Set(defaultRevokeHeader, "1")
+				w.Header().Set("X-Auth-User", "9")
+				w.Header().Set(defaultRotateHeader, "1")
+				w.Header().Set(defaultLabelsHeader, "adm")
+				w.Header().Add("Set-Cookie", "JSESSIONID=secret; Path=/")
+				w.Header().Add("Set-Cookie", "XSRF-TOKEN=secret; Path=/")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("upstream body"))
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			result := rec.Result()
+			if result.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", result.StatusCode)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("upstream body leaked on failed revoke: %q", rec.Body.String())
+			}
+			if got := result.Header.Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("Set-Cookie leaked on failed revoke: %v", got)
+			}
+			for _, name := range []string{defaultRevokeHeader, "X-Auth-User", defaultRotateHeader, defaultLabelsHeader} {
+				if got := result.Header.Get(name); got != "" {
+					t.Fatalf("managed header %s leaked: %q", name, got)
+				}
+			}
+			if got, err := mgr.Resolve(ctx, key); err != nil || got == nil {
+				t.Fatalf("failed revoke unexpectedly destroyed session: live=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+type contendedRevokeStore struct{ store.Store }
+
+func (s *contendedRevokeStore) Lock(context.Context, string, time.Duration) (func(context.Context) error, bool, error) {
+	return nil, false, nil
+}
+
+func TestRevokeLockContentionFailsClosedUnderFailOpen(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	base := store.NewMemory()
+	contended := &contendedRevokeStore{Store: base}
+	mgr := session.NewManager(contended, clk, session.Config{
+		Inactive: 30 * time.Minute, Final: 8 * time.Hour, Synchronize: true,
+	}, nil)
+	h := &Handler{
+		Cookie:           CookieConfig{Name: "__gosestor"},
+		IdentityHeader:   "X-Auth-User",
+		OnStoreError:     "fail_open",
+		manager:          mgr,
+		store:            contended,
+		filter:           filter.New(nil, []string{"JSESSIONID"}),
+		logger:           zap.NewNop(),
+		rotateHeaderName: defaultRotateHeader,
+		revokeHeaderName: defaultRevokeHeader,
+		revokeEnabled:    true,
+		labelsHeaderName: defaultLabelsHeader,
+	}
+	live, _ := mgr.Begin(ctx)
+	key := live.KeyID
+	req := httptest.NewRequest(http.MethodPost, "http://x/logout", nil)
+	req.Header.Set("Cookie", "__gosestor="+key)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set(defaultRevokeHeader, "1")
+		w.Header().Add("Set-Cookie", "JSESSIONID=secret; Path=/")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get(defaultRevokeHeader); got != "" {
+		t.Fatalf("revoke header leaked: %q", got)
+	}
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("Set-Cookie leaked: %v", got)
+	}
+}
+
 type deleteCookieFailStore struct{ store.Store }
 
-func (s *deleteCookieFailStore) DeleteCookie(context.Context, string, string) error {
-	return errors.New("delete cookie failed")
+func (s *deleteCookieFailStore) ApplySessionControls(ctx context.Context, id string, controls store.SessionControls, ttl, ownerTTL time.Duration) error {
+	for _, cookie := range controls.Cookies {
+		if cookie.Delete {
+			return errors.New("delete cookie failed")
+		}
+	}
+	return s.Store.ApplySessionControls(ctx, id, controls, ttl, ownerTTL)
 }
 
 func TestDeleteCookieFailureScrubsResponseHeaders(t *testing.T) {
@@ -1142,6 +1837,13 @@ func TestDeleteCookieFailureScrubsResponseHeaders(t *testing.T) {
 				if got := result.Header.Get(name); got != "" {
 					t.Fatalf("%s leaked after delete failure: %q", name, got)
 				}
+			}
+			resolved, err := mgr.Resolve(ctx, live.KeyID)
+			if err != nil || resolved == nil {
+				t.Fatalf("cookie failure stranded old key: live=%+v err=%v", resolved, err)
+			}
+			if resolved.OwnerID != 0 || len(resolved.Labels) != 0 {
+				t.Fatalf("controls applied before cookie failure: owner=%d labels=%v", resolved.OwnerID, resolved.Labels)
 			}
 		})
 	}

@@ -36,6 +36,15 @@ func main() {
 		fmt.Fprintln(w, "backend set JSESSIONID (stored), X-Auth-User (owner-bound), and granted label: default.")
 	})
 
+	// Current-session logout expires the backend cookie and asks gosestor to
+	// delete the complete proxy session. Both control values are consumed by
+	// the proxy and never reach the client.
+	mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "", Path: "/", MaxAge: -1})
+		w.Header().Set("X-Session-Revoke", "1")
+		fmt.Fprintln(w, "backend requested current-session logout.")
+	})
+
 	// CSRF sets a forward-listed cookie: it should reach the client unchanged.
 	mux.HandleFunc("/csrf", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "XSRF-TOKEN", Value: "t0ken", Path: "/"})

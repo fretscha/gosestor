@@ -62,7 +62,7 @@ The heart of the plugin is `ServeHTTP` (`session_store.go`):
 ```
 REQUEST PATH (read-mostly, never destroys client state)
 ──────────────────────────────────────────────────────────
-(0) strip identity header from request + trailers      ← anti-spoof
+(0) strip all backend control headers from requests/trailers ← anti-spoof
 (1) read __gosestor cookie
 (2) Resolve(KEY_ID):                                     internal/session/manager.go
       key → sid → session row; enforce timeouts;
@@ -72,40 +72,47 @@ REQUEST PATH (read-mostly, never destroys client state)
       names, inject cached values
 (4) call next handler (reverse_proxy → backend)
 
-RESPONSE PATH (all mutations, wrapped in the interceptor)
+RESPONSE PATH (all normal HTTP responses are staged by the interceptor)
 ──────────────────────────────────────────────────────────
-ensureProcessed() — runs EXACTLY ONCE, just before the
-first WriteHeader/Write/Flush/Hijack:
-  capture + remove ALL Set-Cookie                 ┐
-  (5) bind owner from identity header, strip      │ under per-session
-  (6) parse + filter Set-Cookie: fwd/store/drop;  │ lock when
-      stored expiries delete cached value + SHA   │ synchronize_sessions
-  (6b) MaybeRotate — the KEY swap, LAST           │
-  (7) emit new __gosestor if key changed          ┘
+  buffer status/body while next handler runs
+  downstream error → discard body + controls + cookies; mutate nothing
+  downstream success:
+    remove managed trailer declarations and late values
+    capture + remove ALL Set-Cookie                 ┐
+    parse + strip revoke header before lock;         │
+        truthy → delete complete session and return  │ under per-session
+    (5) parse owner/rotation/labels controls; strip   │ lock when
+    (6) parse + filter Set-Cookie: fwd/store/drop;   │ synchronize_sessions
+    (6b) atomically commit cookies + owner + labels  │
+        + timestamps + optional key rotation         │
+    (7) emit new/expired __gosestor as required      ┘
+  commit staged status/body only after success
 ```
 
 ### The interceptor
 
 Caddy hands us the `ResponseWriter` before the backend writes. The
-`interceptor` wraps it and defers all header rewriting to a `sync.Once`:
+`interceptor` stages normal HTTP status/body output until `next.ServeHTTP`
+returns. This is intentional: a backend can write headers, flush bytes, and
+still return an error. Delaying the wire commit ensures that such an error
+applies no session mutation and leaks neither staged body nor backend metadata.
+Managed trailer declarations and values populated after `WriteHeader` are
+removed after the backend returns and before the response is committed.
 
-```go
-func (ic *interceptor) WriteHeader(status int) {
-	ic.ensureProcessed()          // ← header pipeline fires here, once
-	...
-}
-```
-
-`Flush` and `Hijack` also call `ensureProcessed()` first — that's why SSE
-streams and WebSocket upgrades can't smuggle an unfiltered `Set-Cookie` past
-the pipeline. There is deliberately **no `Unwrap()`**: Go's
-`http.ResponseController` would use it to reach the raw writer and commit
-headers before our scrub.
+`Flush` records the implicit status but does not bypass staging. A hijacked
+connection cannot be rolled back, so the interceptor strips all managed
+metadata and permits no response-driven session mutation, then commits the
+scrubbed `101`/upgrade handshake before delegating the raw connection. There is
+deliberately **no `Unwrap()`**: Go's
+`http.ResponseController` must not reach the raw writer before the scrub.
 
 The fail-safe in `ensureProcessed` is unconditional: on *any* response-path
-error, **all** `Set-Cookie` and the identity header are deleted before anything
-reaches the wire. `fail_closed` additionally turns the response into a 502;
-`fail_open` lets it through, just session-less. Secrets never leak either way.
+error, **all** `Set-Cookie` and managed control headers/trailers are deleted
+before anything reaches the wire. `fail_closed` additionally turns the response
+into a 502; `fail_open` lets ordinary cache failures through without managed
+state. A requested revocation is stricter: deletion or lock failure always
+returns 502 in either mode, so logout can never look successful while the
+session survives. Secrets never leak in any mode.
 
 ## 4. Session lifecycle — `internal/session/manager.go`
 
@@ -123,10 +130,12 @@ codebase:
 // Resolve (request path):  DECIDE only
 rotateDue = now - sess.LastRotation >= interval
 
-// MaybeRotate (response path, step 6b): EXECUTE
-GetSession → re-check still due   // concurrent request may have won
-PutSession(LastRotation=now)      // BEFORE the swap ─┐ failure here = retry next interval,
-rotateKey: PutKey(new) → DeleteKey(old)  //           ┘ client's key untouched
+// Response path, step 6b: EXECUTE after downstream success
+GetSession → re-check still due
+ApplySessionControls(cookies, owner, labels, old → new, now)
+// One Memory critical section / Redis script atomically validates the old key,
+// applies cookie writes/deletes, changes the key mapping + reverse set, applies
+// controls and timestamps, and aligns cascade TTLs.
 ```
 
 Why the ceremony? Ordering is everything:
@@ -144,12 +153,17 @@ Both regression tests for this are **mutation-validated** — re-introducing
 request-path rotation makes `TestUpstreamErrorAtRotationBoundaryKeepsOldKey`
 fail.
 
-**Login rotation** (`BindOwner`) hard-deletes the old key with *no grace
-window*: a graced key still maps to the now-authenticated session, and since
-`Resolve` slides TTLs on every use, a fixated pre-auth key could be renewed
-forever. Hard delete closes session fixation completely. Interval rotation
-reuses the same `rotateKey`, and `MaybeRotate` skips if `rewrite` is already
-set — login + interval boundary in one request means exactly one swap.
+**Login and label rotation** use that same atomic response transition. A stale
+concurrent response that already lost the key race therefore cannot change
+backend cookies, identity, labels, timestamps, reverse indexes, or cascade TTLs.
+Cookie writes/deletes share the same old-key CAS and atomic transition, so a
+stale response cannot attach backend authentication state to the winner's
+session. Revocation still wins because the
+transition requires both the session hash and the request's old key mapping to
+exist. Hard deletion leaves no grace window: a graced key still maps to the
+now-authenticated session, and a fixated pre-auth key could otherwise be
+renewed indefinitely. A fresh pending key suppresses a second swap, so
+login + interval boundary in one response means exactly one swap.
 
 Legacy sessions (created before `rotate_interval` existed) have
 `last_rotation == 0`; `Resolve` backfills the clock instead of mass-rotating
@@ -172,6 +186,23 @@ now-elevated session), and no-ops when `rewrite` is already pending — login +
 rotate request in one response means exactly one swap. Setting `LastRotation`
 also resets the periodic clock, so an interval rotation never immediately
 follows a requested one.
+
+**Current-session logout** (`Live.Revoke`) is backend-driven through
+`revoke_header` (default `X-Session-Revoke`). The handler parses and strips the
+signal before trying the per-session lock, so even lock contention is recognized
+as a failed logout rather than an ordinary fail-open cache error. A true value
+wins over identity, labels, rotation, and every backend `Set-Cookie`: the complete
+session cascade is deleted and the client proxy cookie is expired. A request
+without a live session never mints one; a presented stale proxy cookie is still
+expired. Invalid/false/disabled signals are stripped and otherwise ignored.
+
+Revocation is also the store's stale-write boundary. Field-scoped session
+mutations, `PutKey`, and `PutCookie` require the session hash to still exist,
+atomically with their mutation (mutex in Memory, Lua in Redis). Separating
+access touches, rotation, and labels also prevents stale reads from reverting a
+concurrent owner or privilege transition. Thus a concurrent response resolved
+before logout cannot recreate the session or leave orphan keys/cookies after the
+delete. Redis performs the complete `DeleteSession` cascade atomically as well.
 
 **Labels and path-based authorization** (`internal/authz` + steps 1b/5c) turn
 the proxy into the authorization enforcement point. `internal/authz`
@@ -217,7 +248,15 @@ gs:lock:<SID>          → random token          (SET NX + compare-and-delete Lu
 
 Hygiene invariants:
 
-- `DeleteSession` prunes the owner set (reads `owner_id` before the hash dies).
+- `DeleteSession` atomically removes every key, cookie/hash, reverse set, session
+  row, and owner-index membership.
+- Field-scoped session mutations, `PutKey`, `ReplaceKey`, and `PutCookie`
+  reject missing sessions, preventing stale concurrent responses from recreating
+  revoked state or orphaning data. Temporal fields advance monotonically, and
+  successful activity refreshes the session, current key, reverse-key set, and
+  cookie/SHA hashes to one bounded TTL. Lua uses Redis `TIME` at execution to cap
+  every refresh against both the persisted inactivity deadline and absolute final
+  deadline; delayed or stale responses cannot regress timestamps or extend TTLs.
 - `DeleteKey` prunes the session's reverse key-set.
 - Owner sets carry a TTL sliding on each login, so abandoned sets expire even
   though TTL-expired sessions never pass through `DeleteSession`.
@@ -262,10 +301,11 @@ Redis pool.
 | Threat                     | Defense                                                                  | Where                              |
 |----------------------------|--------------------------------------------------------------------------|------------------------------------|
 | Session fixation           | hard-delete rotation on identity change                                  | `manager.go` `BindOwner`/`rotateKey` |
-| Identity spoofing          | header **and trailer** stripped from request; header stripped from response | `session_store.go` ServeHTTP/processLocked |
+| Control-header spoofing    | managed headers stripped immediately; EOF-aware body wrapper strips late trailers | `session_store.go` ServeHTTP       |
+| Current-session logout     | atomic cascade; expiry cookie; stale mutations require live session; failures 502 | `Live.Revoke`, store Lua             |
 | Cookie smuggling           | client copies of managed names dropped upstream; KEY_ID never forwarded  | `prepareUpstreamCookies`           |
-| Secret leak on failure     | unconditional Set-Cookie + identity scrub, fail_closed 502               | `ensureProcessed`                  |
-| Scrub bypass via streaming | `Flush`/`Hijack` process headers first; no `Unwrap`                      | interceptor                        |
+| Secret leak on failure     | cookies and controls scrubbed on mutation and downstream-error paths     | `ensureProcessed`/`discardBackendMetadata` |
+| Scrub bypass via streaming | normal responses stage until success; hijacks discard managed metadata/state | interceptor                        |
 | Key guessing               | 256-bit `crypto/rand` ids                                                | `manager.go` `newID`               |
 | CSRF-ish cookie config     | `SameSite=None` + `insecure` rejected at validate                        | `Validate`                         |
 | Silent config foot-guns    | `ParseBool` errors, negative durations rejected, `rotate_on_login` is `*bool` (JSON omission → **true**) | `session_store.go` |

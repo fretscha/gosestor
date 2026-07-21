@@ -15,6 +15,19 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 # an empty jar reaches the explicit checks instead of tripping set -e.
 proxy_cookie() { awk '/__gosestor/ {v=$7} END{print v}' "$JAR"; }
 
+# Compose can report containers started before Caddy has bound its listener.
+# Wait for an actual successful proxy response so the first login is not lost
+# to a startup connection reset.
+ready=false
+for _ in $(seq 1 30); do
+    if curl -fsS "$BASE/" >/dev/null 2>&1; then
+        ready=true
+        break
+    fi
+    sleep 1
+done
+[ "$ready" = true ] || fail "proxy did not become ready at $BASE"
+
 hr
 echo "1) LOGIN — backend sets JSESSIONID (stored) + X-Auth-User (owner-bound)."
 echo "   Expect: only __gosestor is Set-Cookie; no JSESSIONID, no X-Auth-User."
@@ -144,6 +157,25 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H 'Accept: text/html' "
 BODY=$(curl -s -b "$JAR" -c "$JAR" "$BASE/account")
 echo "$BODY" | grep -q 'account area' || fail "default tier lost after step-down"
 echo "adm revoked: /admin -> 302, /account still 200 (rotated: ...${OLD_KEY: -8} -> ...${NEW_KEY: -8})"
+
+hr
+echo "12) CURRENT-SESSION LOGOUT — /logout returns X-Session-Revoke: 1."
+echo "    Expect: control header and JSESSIONID stay hidden, __gosestor expires, old key dies."
+hr
+OLD_KEY=$(proxy_cookie)
+[ -n "$OLD_KEY" ] || fail "no proxy cookie before current-session logout"
+HDRS=$(curl -si -X POST -b "$JAR" -c "$JAR" "$BASE/logout")
+echo "$HDRS" | grep -iE '^HTTP/|^set-cookie:' || true
+if echo "$HDRS" | grep -qi '^x-session-revoke:'; then
+    fail "X-Session-Revoke leaked to the client"
+fi
+if echo "$HDRS" | grep -qi '^set-cookie: JSESSIONID'; then
+    fail "backend JSESSIONID deletion leaked to the client"
+fi
+[ -z "$(proxy_cookie)" ] || fail "proxy cookie jar still contains __gosestor after logout"
+curl -s -H "Cookie: __gosestor=$OLD_KEY" "$BASE/" | grep -q 'JSESSIONID ABSENT' \
+    || fail "old KEY_ID still resolves after current-session logout"
+echo "current session revoked; proxy cookie expired and old KEY_ID is dead"
 
 echo
 echo "Done — all checks passed."

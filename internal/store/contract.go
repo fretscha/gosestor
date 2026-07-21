@@ -38,6 +38,185 @@ func RunContract(t *testing.T, newStore func() Store) {
 		}
 	})
 
+	t.Run("stale mutations cannot recreate a deleted session", func(t *testing.T) {
+		s := newStore()
+		missing := Session{ID: "gone", Creation: 1, LastAccess: 2, InactiveTimeout: 10, FinalTimeout: 100}
+		if err := s.TouchSession(ctx, missing.ID, "missing-key", 2, 2, time.Hour); err != ErrNotFound {
+			t.Fatalf("TouchSession err = %v, want ErrNotFound", err)
+		}
+		controls := SessionControls{OldKeyID: "missing-key", LastRotation: 2}
+		if err := s.ApplySessionControls(ctx, missing.ID, controls, time.Hour, time.Hour); err != ErrNotFound {
+			t.Fatalf("ApplySessionControls err = %v, want ErrNotFound", err)
+		}
+		if err := s.PutKey(ctx, "orphan-key", "gone", time.Hour); err != ErrNotFound {
+			t.Fatalf("PutKey err = %v, want ErrNotFound", err)
+		}
+		if _, err := s.GetKey(ctx, "orphan-key"); err != ErrNotFound {
+			t.Fatalf("orphan key was created: %v", err)
+		}
+		if err := s.PutCookie(ctx, "gone", "JSESSIONID", "secret", "sha"); err != ErrNotFound {
+			t.Fatalf("PutCookie err = %v, want ErrNotFound", err)
+		}
+		if values, _ := s.GetCookies(ctx, "gone"); len(values) != 0 {
+			t.Fatalf("orphan cookie was created: %v", values)
+		}
+		if shas, _ := s.CookieSHAs(ctx, "gone"); len(shas) != 0 {
+			t.Fatalf("orphan cookie SHA was created: %v", shas)
+		}
+	})
+
+	t.Run("field-scoped updates preserve unrelated state", func(t *testing.T) {
+		s := newStore()
+		original := Session{
+			ID: "scoped", Creation: 1, LastAccess: 1, InactiveTimeout: 10,
+			FinalTimeout: 100, OwnerID: 42, LastRotation: 10, Labels: "default",
+		}
+		if err := s.PutSession(ctx, original, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutKey(ctx, "scoped-key", original.ID, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.TouchSession(ctx, original.ID, "scoped-key", 2, 99, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := s.GetSession(ctx, original.ID)
+		if got.LastAccess != 2 || got.LastRotation != 10 || got.OwnerID != 42 || got.Labels != "default" {
+			t.Fatalf("touch overwrote unrelated state: %+v", got)
+		}
+		if err := s.RotateSessionKey(ctx, original.ID, "scoped-key", "rotated-key", 20, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = s.GetSession(ctx, original.ID)
+		if got.LastRotation != 20 || got.OwnerID != 42 || got.Labels != "default" {
+			t.Fatalf("rotation overwrote unrelated state: %+v", got)
+		}
+		controls := SessionControls{SetLabels: true, Labels: "adm", LastAccess: 3, OldKeyID: "rotated-key"}
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = s.GetSession(ctx, original.ID)
+		if got.Labels != "adm" || got.LastAccess != 3 || got.LastRotation != 20 || got.OwnerID != 42 {
+			t.Fatalf("label-only update overwrote unrelated state: %+v", got)
+		}
+		controls.Labels = "default adm"
+		controls.LastAccess = 4
+		controls.LastRotation = 30
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = s.GetSession(ctx, original.ID)
+		if got.Labels != "default adm" || got.LastAccess != 4 || got.LastRotation != 30 || got.OwnerID != 42 {
+			t.Fatalf("label+rotation update mismatch: %+v", got)
+		}
+		if err := s.TouchSession(ctx, original.ID, "rotated-key", 3, 20, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		controls.Labels = "latest"
+		controls.LastAccess = 3
+		controls.LastRotation = 20
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = s.GetSession(ctx, original.ID)
+		if got.Labels != "latest" || got.LastAccess != 4 || got.LastRotation != 30 {
+			t.Fatalf("stale temporal update regressed state: %+v", got)
+		}
+	})
+
+	t.Run("atomic key replacement admits only one winner", func(t *testing.T) {
+		s := newStore()
+		_ = s.PutSession(ctx, Session{ID: "sid", Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}, time.Hour)
+		_ = s.PutKey(ctx, "old", "sid", time.Hour)
+		if err := s.ReplaceKey(ctx, "old", "new-1", "sid", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReplaceKey(ctx, "old", "new-2", "sid", time.Hour); err != ErrConflict {
+			t.Fatalf("losing replacement err = %v, want ErrConflict", err)
+		}
+		if _, err := s.GetKey(ctx, "old"); err != ErrNotFound {
+			t.Fatalf("old key survived: %v", err)
+		}
+		if sid, err := s.GetKey(ctx, "new-1"); err != nil || sid != "sid" {
+			t.Fatalf("winning key = %q, %v", sid, err)
+		}
+		if _, err := s.GetKey(ctx, "new-2"); err != ErrNotFound {
+			t.Fatalf("losing key became valid: %v", err)
+		}
+	})
+
+	t.Run("equal old and new rotation key is rejected atomically", func(t *testing.T) {
+		s := newStore()
+		original := Session{ID: "equal-key", Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100, LastRotation: 1}
+		if err := s.PutSession(ctx, original, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutKey(ctx, "same-key", original.ID, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		controls := SessionControls{
+			OldKeyID: "same-key", NewKeyID: "same-key", Rotate: true,
+			LastAccess: 2, LastRotation: 2,
+		}
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != ErrConflict {
+			t.Fatalf("equal-key rotation err = %v, want ErrConflict", err)
+		}
+		if sid, err := s.GetKey(ctx, "same-key"); err != nil || sid != original.ID {
+			t.Fatalf("equal-key conflict changed mapping: sid=%q err=%v", sid, err)
+		}
+		got, err := s.GetSession(ctx, original.ID)
+		if err != nil || got.LastAccess != original.LastAccess || got.LastRotation != original.LastRotation {
+			t.Fatalf("equal-key conflict changed session: got=%+v err=%v", got, err)
+		}
+	})
+
+	t.Run("atomic response controls are all-or-nothing", func(t *testing.T) {
+		s := newStore()
+		original := Session{ID: "controls", Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100, OwnerID: 1, Labels: "default"}
+		_ = s.PutSession(ctx, original, time.Hour)
+		_ = s.PutKey(ctx, "old-controls", original.ID, time.Hour)
+		_ = s.AddOwnerIndex(ctx, 1, original.ID, time.Hour)
+		controls := SessionControls{
+			SetOwner: true, OwnerID: 2, SetLabels: true, Labels: "adm",
+			LastAccess: 2, LastRotation: 2, OldKeyID: "old-controls", NewKeyID: "new-controls", Rotate: true,
+			Cookies: []CookieMutation{{Name: "JSESSIONID", Value: "winner", SHA: "winner-sha"}},
+		}
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetSession(ctx, original.ID)
+		if err != nil || got.OwnerID != 2 || got.Labels != "adm" || got.LastAccess != 2 || got.LastRotation != 2 {
+			t.Fatalf("controls mismatch: %+v err=%v", got, err)
+		}
+		if _, err := s.GetKey(ctx, "old-controls"); err != ErrNotFound {
+			t.Fatalf("old controls key survived: %v", err)
+		}
+		if sid, err := s.GetKey(ctx, "new-controls"); err != nil || sid != original.ID {
+			t.Fatalf("new controls key = %q, %v", sid, err)
+		}
+		if err := s.TouchSession(ctx, original.ID, "old-controls", 99, 99, time.Hour); err != ErrConflict {
+			t.Fatalf("stale touch err = %v, want ErrConflict", err)
+		}
+		controls.NewKeyID = "losing-controls"
+		controls.OwnerID = 3
+		controls.Labels = "stale"
+		controls.LastAccess = 3
+		controls.LastRotation = 3
+		controls.Cookies = []CookieMutation{{Name: "JSESSIONID", Value: "stale", SHA: "stale-sha"}}
+		if err := s.ApplySessionControls(ctx, original.ID, controls, time.Hour, time.Hour); err != ErrConflict {
+			t.Fatalf("stale controls err = %v, want ErrConflict", err)
+		}
+		got, _ = s.GetSession(ctx, original.ID)
+		if got.OwnerID != 2 || got.Labels != "adm" || got.LastRotation != 2 {
+			t.Fatalf("stale controls partially applied: %+v", got)
+		}
+		cookies, _ := s.GetCookies(ctx, original.ID)
+		shas, _ := s.CookieSHAs(ctx, original.ID)
+		if cookies["JSESSIONID"] != "winner" || shas["JSESSIONID"] != "winner-sha" {
+			t.Fatalf("stale controls changed cookies: cookies=%v shas=%v", cookies, shas)
+		}
+	})
+
 	t.Run("key mapping and delete cascade", func(t *testing.T) {
 		s := newStore()
 		_ = s.PutSession(ctx, Session{ID: "sid", Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}, time.Hour)
@@ -133,7 +312,7 @@ func RunContract(t *testing.T, newStore func() Store) {
 
 	t.Run("owner reassignment updates row and indexes atomically", func(t *testing.T) {
 		s := newStore()
-		original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100}
+		original := Session{ID: "sid", OwnerID: 41, Creation: 1, LastAccess: 1, InactiveTimeout: 10, FinalTimeout: 100, LastRotation: 10, Labels: "default"}
 		if err := s.PutSession(ctx, original, time.Hour); err != nil {
 			t.Fatal(err)
 		}
@@ -143,11 +322,13 @@ func RunContract(t *testing.T, newStore func() Store) {
 		updated := original
 		updated.OwnerID = 42
 		updated.LastAccess = 2
+		updated.Labels = "stale"
+		updated.Creation = 999
 		if err := s.ReassignOwner(ctx, updated, time.Hour, 2*time.Hour); err != nil {
 			t.Fatal(err)
 		}
 		got, err := s.GetSession(ctx, "sid")
-		if err != nil || got.OwnerID != 42 || got.LastAccess != 2 {
+		if err != nil || got.OwnerID != 42 || got.LastAccess != 2 || got.Creation != 1 || got.Labels != "default" {
 			t.Fatalf("session after reassignment = %+v, %v", got, err)
 		}
 		oldSIDs, err := s.OwnerSessions(ctx, 41)

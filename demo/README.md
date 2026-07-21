@@ -70,6 +70,10 @@ The proxy listens on <http://localhost:8080>. In another terminal:
 11. **Step-down** — `/stepdown` grants only `default`: `adm` is revoked by
     the same REPLACE mechanism that granted it, the cookie rotates again,
     and `/admin` closes while `/account` stays open.
+12. **Current-session logout** — `/logout` expires the backend session cookie
+    and returns `X-Session-Revoke: 1`. gosestor strips both, deletes the complete
+    proxy session and owner-index membership, expires `__gosestor`, and rejects
+    a replay of its former value.
 
 ## Notes
 
@@ -98,4 +102,7 @@ curl -si -c jar.txt http://localhost:8080/login
 
 # Reuse it; the backend sees JSESSIONID re-injected.
 curl -s -b jar.txt http://localhost:8080/
+
+# Revoke only this proxy session; the jar receives an expired __gosestor.
+curl -si -X POST -b jar.txt -c jar.txt http://localhost:8080/logout
 ```

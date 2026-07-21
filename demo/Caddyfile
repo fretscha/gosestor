@@ -31,6 +31,7 @@
 		forward XSRF-TOKEN
 		store JSESSIONID
 		identity_header X-Auth-User
+		revoke_header X-Session-Revoke
 		inactive_timeout 30m
 		final_timeout 8h
 		# Absurdly short so the walkthrough can show a live KEY_ID rotation
