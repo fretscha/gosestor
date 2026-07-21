@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -586,6 +587,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer func() { _ = ic.body.Close() }()
 	err := next.ServeHTTP(ic, r)
+	if ic.writeErr != nil {
+		ic.body.Reset()
+		ic.discardBackendMetadata()
+		clearHeaders(w.Header())
+		w.WriteHeader(http.StatusBadGateway)
+		return nil
+	}
 	if err != nil {
 		// Nothing has reached the client yet: discard the staged body and every
 		// backend control/cookie without applying a session mutation.
@@ -594,7 +602,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		clearHeaders(w.Header())
 		return err
 	}
-	if ic.hijacked {
+	if ic.writeErr == nil {
+		ic.writeErr = ic.reserveFinalMetadata()
+	}
+	if ic.writeErr != nil {
+		ic.body.Reset()
+		ic.discardBackendMetadata()
+		clearHeaders(w.Header())
+		w.WriteHeader(http.StatusBadGateway)
+		return nil
+	}
+	if ic.terminal {
+		return nil
+	}
+	if err := ic.body.Validate(); err != nil {
+		ic.body.Reset()
+		ic.discardBackendMetadata()
+		clearHeaders(w.Header())
+		w.WriteHeader(http.StatusBadGateway)
 		return nil
 	}
 	ic.ensureProcessed()
@@ -734,11 +759,11 @@ func (h *Handler) denyAuthz(w http.ResponseWriter, r *http.Request, required str
 	return nil
 }
 
-// interceptor interface guards: streaming and upgrades must keep working
-// through the wrapper (reverse_proxy probes for these).
+// interceptor interface guards: HTTP/1 hijacks and Caddy extended-CONNECT
+// upgrades remain supported; ordinary streaming flushes are rejected.
 var (
-	_ http.Flusher  = (*interceptor)(nil)
-	_ http.Hijacker = (*interceptor)(nil)
+	_ http.Hijacker                   = (*interceptor)(nil)
+	_ interface{ FlushError() error } = (*interceptor)(nil)
 )
 
 type stagedInformationalResponse struct {
@@ -747,26 +772,95 @@ type stagedInformationalResponse struct {
 }
 
 // interceptor stages normal HTTP responses until the downstream result is known.
-const stagedResponseMemoryLimit = 1 << 20
+const (
+	stagedResponseMemoryLimit      = 1 << 20
+	stagedResponseMaxBytes         = 64 << 20
+	stagedResponseAggregateBytes   = 256 << 20
+	stagedResponseMaxInformational = 16
+	stagedResponseMaxMetadataBytes = 1 << 20
+)
+
+var (
+	errStagedResponseTooLarge        = errors.New("session_store: downstream response exceeds 64 MiB staging limit")
+	errStagedResponseBudgetExhausted = errors.New("session_store: aggregate response staging budget exhausted")
+	errHijackWithStagedBody          = errors.New("session_store: cannot hijack with a staged response body")
+	errTooManyInformationalResponses = errors.New("session_store: too many informational responses")
+	errStagedMetadataTooLarge        = errors.New("session_store: downstream response metadata exceeds 1 MiB staging limit")
+	globalStagedResponseBudget       = &stagedResponseBudget{limit: stagedResponseAggregateBytes}
+)
+
+type stagedResponseBudget struct {
+	mu    sync.Mutex
+	limit int64
+	used  int64
+}
+
+func (b *stagedResponseBudget) reserve(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.limit-b.used {
+		return false
+	}
+	b.used += n
+	return true
+}
+
+func (b *stagedResponseBudget) release(n int64) {
+	b.mu.Lock()
+	b.used -= n
+	b.mu.Unlock()
+}
 
 type stagedBody struct {
-	memory bytes.Buffer
-	file   *os.File
-	size   int64
+	memory    bytes.Buffer
+	file      *os.File
+	size      int64
+	budget    *stagedResponseBudget
+	reserved  int64
+	unlinked  bool
+	validated bool
+}
+
+func (b *stagedBody) stagingBudget() *stagedResponseBudget {
+	if b.budget == nil {
+		b.budget = globalStagedResponseBudget
+	}
+	return b.budget
+}
+
+func (b *stagedBody) releaseReserved(n int64) {
+	if n == 0 {
+		return
+	}
+	b.stagingBudget().release(n)
+	b.reserved -= n
 }
 
 func (b *stagedBody) Write(p []byte) (int, error) {
+	if int64(len(p)) > int64(stagedResponseMaxBytes)-b.size {
+		return 0, errStagedResponseTooLarge
+	}
+	if !b.stagingBudget().reserve(int64(len(p))) {
+		return 0, errStagedResponseBudgetExhausted
+	}
+	b.reserved += int64(len(p))
+	b.validated = false
 	if b.file == nil && b.memory.Len()+len(p) <= stagedResponseMemoryLimit {
 		n, err := b.memory.Write(p)
 		b.size += int64(n)
+		b.releaseReserved(int64(len(p) - n))
 		return n, err
 	}
 	if b.file == nil {
 		f, err := os.CreateTemp("", "gosestor-response-*")
 		if err != nil {
+			b.releaseReserved(int64(len(p)))
 			return 0, err
 		}
 		b.file = f
+		// On Unix, unlink immediately so crashes cannot leave sensitive response
+		// bodies in a named spool file. Windows removes it during Close instead.
+		b.unlinked = os.Remove(f.Name()) == nil
 		if _, err := f.Write(b.memory.Bytes()); err != nil {
 			_ = b.Close()
 			return 0, err
@@ -775,15 +869,40 @@ func (b *stagedBody) Write(p []byte) (int, error) {
 	}
 	n, err := b.file.Write(p)
 	b.size += int64(n)
+	b.releaseReserved(int64(len(p) - n))
 	return n, err
+}
+
+func (b *stagedBody) Validate() error {
+	if b.file == nil || b.validated {
+		return nil
+	}
+	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	n, err := io.Copy(io.Discard, b.file)
+	if err != nil {
+		return err
+	}
+	if n != b.size {
+		return io.ErrUnexpectedEOF
+	}
+	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	b.validated = true
+	return nil
 }
 
 func (b *stagedBody) FlushTo(w io.Writer) error {
 	if b.file == nil {
-		_, err := w.Write(b.memory.Bytes())
+		n, err := w.Write(b.memory.Bytes())
+		if err == nil && n != b.memory.Len() {
+			err = io.ErrShortWrite
+		}
 		return err
 	}
-	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
+	if err := b.Validate(); err != nil {
 		return err
 	}
 	_, err := io.Copy(w, b.file)
@@ -797,47 +916,65 @@ func (b *stagedBody) String() string {
 	}
 	return fmt.Sprintf("<%d staged bytes>", b.size)
 }
+
 func (b *stagedBody) Reset() {
 	b.memory.Reset()
 	b.size = 0
+	b.validated = false
 	if b.file != nil {
 		name := b.file.Name()
 		_ = b.file.Close()
-		_ = os.Remove(name)
+		if !b.unlinked {
+			_ = os.Remove(name)
+		}
 		b.file = nil
+		b.unlinked = false
 	}
+	b.releaseReserved(b.reserved)
 }
+
 func (b *stagedBody) Close() error {
-	if b.file == nil {
-		return nil
+	b.memory.Reset()
+	b.size = 0
+	b.validated = false
+	var err error
+	if b.file != nil {
+		name := b.file.Name()
+		err = b.file.Close()
+		if !b.unlinked {
+			removeErr := os.Remove(name)
+			if err == nil {
+				err = removeErr
+			}
+		}
+		b.file = nil
+		b.unlinked = false
 	}
-	name := b.file.Name()
-	err := b.file.Close()
-	removeErr := os.Remove(name)
-	b.file = nil
-	if err != nil {
-		return err
-	}
-	return removeErr
+	b.releaseReserved(b.reserved)
+	return err
 }
 
 type interceptor struct {
 	http.ResponseWriter
-	h               *Handler
-	live            *session.Live
-	ctx             context.Context
-	once            sync.Once
-	failed          bool
-	wroteHeader     bool
-	status          int
-	body            stagedBody
-	responseHeader  http.Header
-	informational   []stagedInformationalResponse
-	hijacked        bool
-	storeErr        error
-	revokeRequested bool
-	hadProxyCookie  bool
-	resolveErr      error
+	h                     *Handler
+	live                  *session.Live
+	ctx                   context.Context
+	once                  sync.Once
+	failed                bool
+	wroteHeader           bool
+	status                int
+	body                  stagedBody
+	responseHeader        http.Header
+	informational         []stagedInformationalResponse
+	hijacked              bool
+	storeErr              error
+	revokeRequested       bool
+	hadProxyCookie        bool
+	resolveErr            error
+	writeErr              error
+	metadataBytes         int64
+	finalMetadataReserved bool
+	terminal              bool
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -849,6 +986,56 @@ func copyHeaders(dst, src http.Header) {
 
 func (ic *interceptor) Header() http.Header { return ic.responseHeader }
 
+func stagedHeaderBytes(h http.Header) int64 {
+	var total int64
+	for name, values := range h {
+		for _, value := range values {
+			total += int64(len(name) + len(value) + 4)
+		}
+	}
+	return total
+}
+
+func (ic *interceptor) reserveMetadataBytes(n int64) error {
+	if n > int64(stagedResponseMaxMetadataBytes)-ic.metadataBytes {
+		return errStagedMetadataTooLarge
+	}
+	if !ic.body.stagingBudget().reserve(n) {
+		return errStagedResponseBudgetExhausted
+	}
+	ic.body.reserved += n
+	ic.metadataBytes += n
+	return nil
+}
+
+func (ic *interceptor) reserveMetadata(h http.Header) error {
+	return ic.reserveMetadataBytes(stagedHeaderBytes(h))
+}
+
+func (ic *interceptor) generatedMetadataAllowance() int64 {
+	if ic.h == nil {
+		return 0
+	}
+	issued := ic.h.buildProxyCookie(strings.Repeat("x", 43))
+	expired := ic.h.buildExpiredProxyCookie()
+	if len(expired) > len(issued) {
+		issued = expired
+	}
+	return int64(len("Set-Cookie") + len(issued) + 4)
+}
+
+func (ic *interceptor) reserveFinalMetadata() error {
+	if ic.finalMetadataReserved {
+		return nil
+	}
+	n := stagedHeaderBytes(ic.Header()) + ic.generatedMetadataAllowance()
+	if err := ic.reserveMetadataBytes(n); err != nil {
+		return err
+	}
+	ic.finalMetadataReserved = true
+	return nil
+}
+
 func (ic *interceptor) WriteHeader(status int) {
 	if ic.wroteHeader {
 		return
@@ -857,6 +1044,18 @@ func (ic *interceptor) WriteHeader(status int) {
 		panic(fmt.Sprintf("invalid WriteHeader code %v", status))
 	}
 	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		if len(ic.informational) >= stagedResponseMaxInformational {
+			if ic.writeErr == nil {
+				ic.writeErr = errTooManyInformationalResponses
+			}
+			return
+		}
+		if err := ic.reserveMetadata(ic.Header()); err != nil {
+			if ic.writeErr == nil {
+				ic.writeErr = err
+			}
+			return
+		}
 		ic.informational = append(ic.informational, stagedInformationalResponse{
 			status: status,
 			header: ic.Header().Clone(),
@@ -868,22 +1067,20 @@ func (ic *interceptor) WriteHeader(status int) {
 }
 
 func (ic *interceptor) Write(b []byte) (int, error) {
+	if ic.terminal {
+		return ic.ResponseWriter.Write(b)
+	}
 	if !ic.wroteHeader {
 		ic.WriteHeader(http.StatusOK)
 	}
 	if ic.status == http.StatusNoContent || ic.status == http.StatusNotModified || (ic.status >= 100 && ic.status < 200) {
 		return 0, http.ErrBodyNotAllowed
 	}
-	return ic.body.Write(b)
-}
-
-// Flush records an implicit 200 but deliberately defers the actual flush until
-// the downstream handler returns successfully. This lets a later downstream
-// error discard all body, metadata, and session mutations.
-func (ic *interceptor) Flush() {
-	if !ic.wroteHeader {
-		ic.WriteHeader(http.StatusOK)
+	n, err := ic.body.Write(b)
+	if err != nil && ic.writeErr == nil {
+		ic.writeErr = err
 	}
+	return n, err
 }
 
 func (ic *interceptor) scrubManagedResponseHeader(h http.Header) {
@@ -903,6 +1100,60 @@ func (ic *interceptor) commitInformational(w http.ResponseWriter) {
 	}
 }
 
+func (ic *interceptor) releaseTerminalStaging() {
+	ic.body.Reset()
+	ic.informational = nil
+	clearHeaders(ic.responseHeader)
+	ic.metadataBytes = 0
+}
+
+func (ic *interceptor) isExtendedConnect() bool {
+	if ic.ctx == nil {
+		return false
+	}
+	_, ok := caddyhttp.GetVar(ic.ctx, "extended_connect_websocket_body").(io.ReadCloser)
+	return ok
+}
+
+// FlushError supports Caddy's HTTP/2 and HTTP/3 extended-CONNECT upgrade path
+// without advertising ordinary streaming. Upgrade handshakes discard managed
+// metadata and response-driven session changes before making an irreversible
+// wire commit.
+func (ic *interceptor) FlushError() error {
+	if !ic.isExtendedConnect() {
+		return http.ErrNotSupported
+	}
+	if ic.terminal {
+		return http.NewResponseController(ic.ResponseWriter).Flush()
+	}
+	if ic.writeErr != nil {
+		return ic.writeErr
+	}
+	if err := ic.reserveFinalMetadata(); err != nil {
+		ic.writeErr = err
+		return err
+	}
+	if ic.body.Len() != 0 {
+		return errHijackWithStagedBody
+	}
+	if !ic.wroteHeader {
+		ic.WriteHeader(http.StatusOK)
+	}
+	ic.discardBackendMetadata()
+	// The handshake is terminal even if the underlying flush fails: bytes may
+	// already be on the wire, so normal response processing must not run.
+	ic.terminal = true
+	ic.commitInformational(ic.ResponseWriter)
+	copyHeaders(ic.ResponseWriter.Header(), ic.Header())
+	ic.ResponseWriter.WriteHeader(ic.status)
+	ic.releaseTerminalStaging()
+	err := http.NewResponseController(ic.ResponseWriter).Flush()
+	if err == nil {
+		ic.hijacked = true
+	}
+	return err
+}
+
 // Hijacked responses cannot be buffered or rolled back. Refuse all managed
 // response metadata and session mutations, then delegate the raw connection.
 func (ic *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -910,19 +1161,29 @@ func (ic *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, fmt.Errorf("session_store: underlying ResponseWriter does not support hijacking")
 	}
+	if ic.writeErr != nil {
+		return nil, nil, ic.writeErr
+	}
+	if err := ic.reserveFinalMetadata(); err != nil {
+		ic.writeErr = err
+		return nil, nil, err
+	}
+	if ic.body.Len() != 0 {
+		return nil, nil, errHijackWithStagedBody
+	}
 	ic.discardBackendMetadata()
-	ic.hijacked = true
+	ic.terminal = true
 	ic.commitInformational(ic.ResponseWriter)
 	copyHeaders(ic.ResponseWriter.Header(), ic.Header())
 	if ic.wroteHeader {
 		ic.ResponseWriter.WriteHeader(ic.status)
 	}
-	if ic.body.Len() > 0 {
-		if err := ic.body.FlushTo(ic.ResponseWriter); err != nil {
-			return nil, nil, err
-		}
+	ic.releaseTerminalStaging()
+	conn, rw, err := hj.Hijack()
+	if err == nil {
+		ic.hijacked = true
 	}
-	return hj.Hijack()
+	return conn, rw, err
 }
 
 func (ic *interceptor) ensureProcessed() {

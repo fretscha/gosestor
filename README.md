@@ -78,10 +78,20 @@ backend. See [`demo/README.md`](demo/README.md).
   so a stale concurrent response cannot attach backend authentication state to a
   newer rotated session.
 - Normal HTTP responses are staged until the upstream handler returns: up to
-  1 MiB in memory, then in a private temporary file. A handler that writes or
-  flushes and later returns an error therefore commits no body, controls,
-  cookies, or session mutation. Managed late response trailers are stripped.
-  Hijacked connections cannot be rolled back, so response-driven session
+  1 MiB in memory, then in a private temporary file that is unlinked immediately
+  where the OS permits. Bodies are capped at 64 MiB per response; staged
+  headers and up to 16 informational responses share a separate 1 MiB
+  per-response metadata cap. Body and metadata reservations share a 256 MiB
+  process-wide concurrent budget. Exceeding a bound fails closed with `502`
+  and applies no response-driven session mutation. The wrapper intentionally
+  does not implement `http.Flusher`: SSE and other ordinary streaming routes
+  must bypass `session_store`, because streamed bytes cannot later be rolled
+  back safely. Caddy's HTTP/2 and HTTP/3 extended-CONNECT WebSocket handshake
+  is supported through its error-returning flush path and, like HTTP/1.x
+  hijacking, discards all response-driven session controls before committing.
+  A handler that writes and later returns an error therefore commits no body,
+  controls, cookies, or session mutation. Managed late response trailers are
+  stripped. Hijacked connections cannot be rolled back, so response-driven session
   controls and backend cookies are discarded; the scrubbed upgrade status and
   ordinary handshake headers are committed before the raw connection is delegated.
 - The client only receives an opaque `KEY_ID`; the internal `SESSION_ID` never

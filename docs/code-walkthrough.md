@@ -93,18 +93,36 @@ RESPONSE PATH (all normal HTTP responses are staged by the interceptor)
 
 Caddy hands us the `ResponseWriter` before the backend writes. The
 `interceptor` stages normal HTTP status/body output until `next.ServeHTTP`
-returns. This is intentional: a backend can write headers, flush bytes, and
-still return an error. Delaying the wire commit ensures that such an error
-applies no session mutation and leaks neither staged body nor backend metadata.
-Managed trailer declarations and values populated after `WriteHeader` are
-removed after the backend returns and before the response is committed.
+returns. Up to 1 MiB stays in memory; larger bodies use a private spool file
+that is unlinked immediately where supported. A response body may stage at
+most 64 MiB. Staged headers plus at most 16 informational responses have a
+separate 1 MiB per-response cap, and all body/metadata reservations share a
+256 MiB process-wide budget. Exceeding any bound produces `502`, discards all
+staged output, and applies no response-driven session mutation.
 
-`Flush` records the implicit status but does not bypass staging. A hijacked
-connection cannot be rolled back, so the interceptor strips all managed
-metadata and permits no response-driven session mutation, then commits the
-scrubbed `101`/upgrade handshake before delegating the raw connection. There is
-deliberately **no `Unwrap()`**: Go's
-`http.ResponseController` must not reach the raw writer before the scrub.
+This is intentional: a backend can write headers and body bytes, then still
+return an error. Delaying the wire commit ensures that such an error applies no
+session mutation and leaks neither staged body nor backend metadata. Managed
+trailer declarations and values populated after `WriteHeader` are removed after
+the backend returns and before the response is committed. Disk-backed bodies are
+read-validated before response-driven state is changed. The atomic store
+transition still precedes the final wire write: sending a replacement credential
+before its key and session state exist would violate fail-closed rotation. A
+socket write failure after that commit can make the client miss a response, as
+with any HTTP server, but cannot expose an uncommitted credential or partially
+apply session state.
+
+The wrapper deliberately does not implement `http.Flusher`; SSE and other
+ordinary streaming routes must be placed outside `session_store`. Streaming
+bytes and later rolling them back on a downstream error are mutually
+incompatible. Caddy's HTTP/2 and HTTP/3 extended-CONNECT WebSocket path is
+supported through `FlushError`: it uses the same irreversible, no-session-
+mutation handshake policy as HTTP/1.x hijacking. A hijacked connection is
+handled separately: the interceptor strips managed
+metadata, applies no response-driven session mutation, commits the scrubbed
+`101`/upgrade handshake, and then delegates the raw connection. There is
+deliberately **no `Unwrap()`**: Go's `http.ResponseController` must not reach the
+raw writer before the scrub.
 
 The fail-safe in `ensureProcessed` is unconditional: on *any* response-path
 error, **all** `Set-Cookie` and managed control headers/trailers are deleted
@@ -305,7 +323,7 @@ Redis pool.
 | Current-session logout     | atomic cascade; expiry cookie; stale mutations require live session; failures 502 | `Live.Revoke`, store Lua             |
 | Cookie smuggling           | client copies of managed names dropped upstream; KEY_ID never forwarded  | `prepareUpstreamCookies`           |
 | Secret leak on failure     | cookies and controls scrubbed on mutation and downstream-error paths     | `ensureProcessed`/`discardBackendMetadata` |
-| Scrub bypass via streaming | normal responses stage until success; hijacks discard managed metadata/state | interceptor                        |
+| Streaming/rollback conflict | `http.Flusher` intentionally unsupported; staged responses have per-response and aggregate bounds | interceptor |
 | Key guessing               | 256-bit `crypto/rand` ids                                                | `manager.go` `newID`               |
 | CSRF-ish cookie config     | `SameSite=None` + `insecure` rejected at validate                        | `Validate`                         |
 | Silent config foot-guns    | `ParseBool` errors, negative durations rejected, `rotate_on_login` is `*bool` (JSON omission → **true**) | `session_store.go` |

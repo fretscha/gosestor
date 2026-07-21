@@ -2,6 +2,7 @@ package gosestor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -90,7 +92,6 @@ func TestUpstreamErrorAtRotationBoundaryKeepsOldKey(t *testing.T) {
 		w.Header().Set("X-Backend-Secret", "must-not-leak")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("must-not-leak"))
-		w.(http.Flusher).Flush()
 		return fmt.Errorf("backend blew up")
 	})
 	if err := h.ServeHTTP(rec, req, next); err == nil {
@@ -430,6 +431,188 @@ func TestInterceptorPreservesStagedStatusSemantics(t *testing.T) {
 	invalid.WriteHeader(42)
 }
 
+func TestInterceptorExplicitlyDoesNotAdvertiseStreaming(t *testing.T) {
+	var w http.ResponseWriter = &interceptor{responseHeader: make(http.Header)}
+	if _, ok := w.(http.Flusher); ok {
+		t.Fatal("staged response writer must not advertise http.Flusher")
+	}
+}
+
+func TestTooManyInformationalResponsesFailClosed(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://x/hints", nil)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		for i := 0; i <= stagedResponseMaxInformational; i++ {
+			w.Header().Set("Link", fmt.Sprintf("</asset-%d>; rel=preload", i))
+			w.WriteHeader(http.StatusEarlyHints)
+		}
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadGateway || rec.Body.Len() != 0 {
+		t.Fatalf("excess informational responses = status %d body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOversizedResponseHeadersFailClosed(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://x/headers", nil)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		w.Header().Set("X-Large", strings.Repeat("x", stagedResponseMaxMetadataBytes+1))
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadGateway || rec.Header().Get("X-Large") != "" {
+		t.Fatalf("oversized headers = status %d header bytes %d", rec.Code, len(rec.Header().Get("X-Large")))
+	}
+}
+
+type shortSuccessWriter struct{}
+
+func (shortSuccessWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
+}
+
+func TestStagedBodyValidateDetectsUnreadableSpool(t *testing.T) {
+	body := stagedBody{}
+	defer func() { _ = body.Close() }()
+	payload := bytes.Repeat([]byte("x"), stagedResponseMemoryLimit+1)
+	if _, err := body.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Validate(); err == nil {
+		t.Fatal("Validate succeeded for closed spool file")
+	}
+}
+
+func TestStagedBodyFlushToRejectsShortWrite(t *testing.T) {
+	body := stagedBody{}
+	defer func() { _ = body.Close() }()
+	if _, err := body.Write([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.FlushTo(shortSuccessWriter{}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("FlushTo error = %v", err)
+	}
+}
+
+func TestStagedBodyRejectsResponseBeyondLimit(t *testing.T) {
+	var body stagedBody
+	defer func() { _ = body.Close() }()
+	chunk := bytes.Repeat([]byte("x"), stagedResponseMemoryLimit)
+	for body.Len() < stagedResponseMaxBytes {
+		if _, err := body.Write(chunk); err != nil {
+			t.Fatalf("write before limit: %v", err)
+		}
+	}
+	if n, err := body.Write([]byte("x")); n != 0 || !errors.Is(err, errStagedResponseTooLarge) {
+		t.Fatalf("write beyond limit = (%d, %v)", n, err)
+	}
+	if body.Len() != stagedResponseMaxBytes {
+		t.Fatalf("staged size = %d, want %d", body.Len(), stagedResponseMaxBytes)
+	}
+}
+
+func TestFinalMetadataReservationIncludesGeneratedProxyCookie(t *testing.T) {
+	h := &Handler{Cookie: CookieConfig{Name: strings.Repeat("n", 512), Path: "/"}}
+	header := http.Header{"X-Large": {strings.Repeat("x", stagedResponseMaxMetadataBytes-100)}}
+	ic := &interceptor{h: h, responseHeader: header}
+	defer func() { _ = ic.body.Close() }()
+	if err := ic.reserveFinalMetadata(); !errors.Is(err, errStagedMetadataTooLarge) {
+		t.Fatalf("final metadata reservation = %v", err)
+	}
+}
+
+func TestResponseMetadataSharesAggregateBudget(t *testing.T) {
+	firstHeader := http.Header{"X-One": {"1234"}}
+	secondHeader := http.Header{"X-Two": {"5678"}}
+	oneSize := stagedHeaderBytes(firstHeader)
+	budget := &stagedResponseBudget{limit: oneSize*2 - 1}
+	first := &interceptor{responseHeader: firstHeader, body: stagedBody{budget: budget}}
+	second := &interceptor{responseHeader: secondHeader, body: stagedBody{budget: budget}}
+	defer func() { _ = first.body.Close() }()
+	defer func() { _ = second.body.Close() }()
+
+	if err := first.reserveFinalMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.reserveFinalMetadata(); !errors.Is(err, errStagedResponseBudgetExhausted) {
+		t.Fatalf("second reservation error = %v", err)
+	}
+	first.body.Reset()
+	if err := second.reserveFinalMetadata(); err != nil {
+		t.Fatalf("reservation after release: %v", err)
+	}
+}
+
+func TestStagedBodiesShareAggregateBudget(t *testing.T) {
+	budget := &stagedResponseBudget{limit: 3}
+	first := stagedBody{budget: budget}
+	second := stagedBody{budget: budget}
+	defer func() { _ = first.Close() }()
+	defer func() { _ = second.Close() }()
+	if _, err := first.Write([]byte("xx")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := second.Write([]byte("xx")); n != 0 || !errors.Is(err, errStagedResponseBudgetExhausted) {
+		t.Fatalf("aggregate overflow = (%d, %v)", n, err)
+	}
+	first.Reset()
+	if _, err := second.Write([]byte("xx")); err != nil {
+		t.Fatalf("released budget was not reusable: %v", err)
+	}
+}
+
+func TestOversizedStagedResponseFailsClosed(t *testing.T) {
+	for _, propagate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("propagate=%v", propagate), func(t *testing.T) {
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, _, _ := newRotationTestHandler(clk)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://x/large", nil)
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+				w.Header().Set("X-Backend-Secret", "must-not-leak")
+				chunk := bytes.Repeat([]byte("x"), stagedResponseMemoryLimit)
+				for written := 0; written < stagedResponseMaxBytes; written += len(chunk) {
+					if _, err := w.Write(chunk); err != nil {
+						return err
+					}
+				}
+				_, err := w.Write([]byte("overflow"))
+				if propagate {
+					return err
+				}
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rec.Code)
+			}
+			if rec.Body.Len() != 0 || rec.Header().Get("X-Backend-Secret") != "" {
+				t.Fatalf("oversized staged response leaked: headers=%v body=%d", rec.Header(), rec.Body.Len())
+			}
+		})
+	}
+}
+
 func TestStagedBodySpillsToPrivateTemporaryFileAndCleansUp(t *testing.T) {
 	var body stagedBody
 	payload := strings.Repeat("x", stagedResponseMemoryLimit+1)
@@ -442,6 +625,11 @@ func TestStagedBodySpillsToPrivateTemporaryFileAndCleansUp(t *testing.T) {
 	name := body.file.Name()
 	if info, err := body.file.Stat(); err != nil || info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("staged file permissions are not private: info=%v err=%v", info, err)
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("staged file remains named while open: %v", err)
+		}
 	}
 	var got strings.Builder
 	if err := body.FlushTo(&got); err != nil {
@@ -501,10 +689,110 @@ func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, nil
 }
 
-// TestInterceptorFlushDefersCommit: an early Flush (SSE) is staged until the
-// downstream handler returns, so a later error can still discard all metadata,
-// body bytes, and session mutations.
-func TestInterceptorFlushDefersCommit(t *testing.T) {
+type failingHijackRecorder struct{ *httptest.ResponseRecorder }
+
+func (h *failingHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, errors.New("hijack failed")
+}
+
+func TestHijackFailureRemainsTerminalWithoutClaimingSuccess(t *testing.T) {
+	rec := &failingHijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	ic := &interceptor{ResponseWriter: rec, responseHeader: make(http.Header), h: &Handler{}}
+	ic.WriteHeader(http.StatusSwitchingProtocols)
+	if _, _, err := ic.Hijack(); err == nil {
+		t.Fatal("Hijack succeeded")
+	}
+	if !ic.terminal {
+		t.Fatal("failed irreversible handshake was not terminal")
+	}
+	if ic.hijacked {
+		t.Fatal("failed hijack was marked successful")
+	}
+	if ic.body.reserved != 0 {
+		t.Fatalf("failed hijack retained %d staged bytes", ic.body.reserved)
+	}
+}
+
+func TestHijackRejectsStagedResponseBody(t *testing.T) {
+	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	ic := &interceptor{ResponseWriter: rec, responseHeader: make(http.Header)}
+	defer func() { _ = ic.body.Close() }()
+	if _, err := ic.Write([]byte("not-an-upgrade-body")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ic.Hijack(); !errors.Is(err, errHijackWithStagedBody) {
+		t.Fatalf("Hijack error = %v", err)
+	}
+	if rec.hijacked {
+		t.Fatal("underlying connection was hijacked with a staged body")
+	}
+}
+
+// TestInterceptorDoesNotExposeStreaming verifies that downstream handlers can
+// detect that rollback-safe staging does not support streaming semantics.
+func TestFlushErrorOnlyCommitsExtendedConnect(t *testing.T) {
+	h := &Handler{rotateHeaderName: "X-Rotate", revokeHeaderName: "X-Revoke", labelsHeaderName: "X-Labels"}
+
+	t.Run("ordinary streaming unsupported", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		ic := &interceptor{ResponseWriter: rec, responseHeader: make(http.Header), h: h}
+		if err := ic.FlushError(); !errors.Is(err, http.ErrNotSupported) {
+			t.Fatalf("FlushError = %v", err)
+		}
+		if rec.Flushed || rec.Code != http.StatusOK {
+			t.Fatalf("ordinary flush touched writer: flushed=%v status=%d", rec.Flushed, rec.Code)
+		}
+	})
+
+	t.Run("extended connect commits scrubbed handshake", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		budget := &stagedResponseBudget{limit: stagedResponseMaxMetadataBytes}
+		ctx := context.WithValue(context.Background(), caddyhttp.VarsCtxKey, map[string]any{})
+		ic := &interceptor{
+			ResponseWriter: rec, responseHeader: make(http.Header), h: h,
+			ctx: ctx, body: stagedBody{budget: budget},
+		}
+		// Caddy sets this inside reverse_proxy.ServeHTTP, after session_store has
+		// already constructed the interceptor.
+		caddyhttp.SetVar(ctx, "extended_connect_websocket_body", io.NopCloser(strings.NewReader("")))
+		defer func() { _ = ic.body.Close() }()
+		ic.Header().Set("X-Rotate", "1")
+		ic.Header().Set("X-Upgrade-Metadata", "safe")
+		ic.WriteHeader(http.StatusOK)
+		if err := ic.FlushError(); err != nil {
+			t.Fatal(err)
+		}
+		if !rec.Flushed || rec.Code != http.StatusOK {
+			t.Fatalf("extended connect flush: flushed=%v status=%d", rec.Flushed, rec.Code)
+		}
+		if got := rec.Header().Get("X-Rotate"); got != "" {
+			t.Fatalf("managed header leaked: %q", got)
+		}
+		if got := rec.Header().Get("X-Upgrade-Metadata"); got != "safe" {
+			t.Fatalf("ordinary upgrade header = %q", got)
+		}
+		if !ic.hijacked {
+			t.Fatal("extended connect was not marked terminal")
+		}
+		if budget.used != 0 {
+			t.Fatalf("extended connect retained %d staged bytes", budget.used)
+		}
+		if _, err := ic.Write([]byte("frame")); err != nil {
+			t.Fatal(err)
+		}
+		if err := ic.FlushError(); err != nil {
+			t.Fatal(err)
+		}
+		if got := rec.Body.String(); got != "frame" {
+			t.Fatalf("extended-connect stream body = %q", got)
+		}
+		if ic.body.Len() != 0 || budget.used != 0 {
+			t.Fatalf("extended-connect frame was staged: body=%d budget=%d", ic.body.Len(), budget.used)
+		}
+	})
+}
+
+func TestInterceptorDoesNotExposeStreaming(t *testing.T) {
 	clk := &testClock{t: time.Unix(1_000_000, 0)}
 	h, _, _ := newRotationTestHandler(clk)
 
@@ -512,26 +800,24 @@ func TestInterceptorFlushDefersCommit(t *testing.T) {
 	rec := httptest.NewRecorder()
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Add("Set-Cookie", "JSESSIONID=secret; Path=/")
-		f, ok := w.(http.Flusher)
-		if !ok {
-			t.Fatal("interceptor does not implement http.Flusher")
+		if _, ok := w.(http.Flusher); ok {
+			t.Fatal("rollback-safe interceptor advertised streaming support")
 		}
-		f.Flush() // stream start — headers commit NOW
-		_, _ = w.Write([]byte("data: hi\n\n"))
+		_, _ = w.Write([]byte("complete response"))
 		return nil
 	})
 	if err := h.ServeHTTP(rec, req, next); err != nil {
 		t.Fatal(err)
 	}
 	if rec.Flushed {
-		t.Fatal("flush reached the underlying writer before downstream completion")
+		t.Fatal("underlying writer was unexpectedly flushed")
 	}
-	if got := rec.Body.String(); got != "data: hi\n\n" {
+	if got := rec.Body.String(); got != "complete response" {
 		t.Fatalf("body = %q", got)
 	}
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == "JSESSIONID" {
-			t.Fatal("store-managed cookie leaked to the client via early flush")
+			t.Fatal("store-managed cookie leaked to the client")
 		}
 	}
 }
