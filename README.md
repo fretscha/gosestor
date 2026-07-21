@@ -41,6 +41,7 @@ backend. See [`demo/README.md`](demo/README.md).
             }
             cookie {
                 name       __gosestor
+                path       /              # default: /; keep logout endpoints in scope
                 same_site  lax
             }
             forward  XSRF-TOKEN
@@ -51,6 +52,7 @@ backend. See [`demo/README.md`](demo/README.md).
             rotate_on_login   true
             rotate_interval   15m
             rotate_header     X-Session-Rotate
+            revoke_header     X-Session-Revoke
             labels_header     X-Session-Labels
             authz {
                 require /auth   anonymous
@@ -72,7 +74,16 @@ backend. See [`demo/README.md`](demo/README.md).
   (`Max-Age=0`, negative `Max-Age`, or an elapsed `Expires` without a positive
   `Max-Age`) atomically removes its cached value and SHA, so it is not injected
   on later requests. Malformed `Set-Cookie` values are dropped without minting
-  a session.
+  a session. Cookie writes/deletes share the response's old-key compare-and-swap,
+  so a stale concurrent response cannot attach backend authentication state to a
+  newer rotated session.
+- Normal HTTP responses are staged until the upstream handler returns: up to
+  1 MiB in memory, then in a private temporary file. A handler that writes or
+  flushes and later returns an error therefore commits no body, controls,
+  cookies, or session mutation. Managed late response trailers are stripped.
+  Hijacked connections cannot be rolled back, so response-driven session
+  controls and backend cookies are discarded; the scrubbed upgrade status and
+  ordinary handshake headers are committed before the raw connection is delegated.
 - The client only receives an opaque `KEY_ID`; the internal `SESSION_ID` never
   leaves the server. On an authenticated identity change the `KEY_ID` rotates and
   the old key is **hard-deleted immediately** (session-fixation defense; no grace
@@ -95,6 +106,17 @@ backend. See [`demo/README.md`](demo/README.md).
   triggering (the default header name is still stripped), and `rotate_header
   <name>` renames it. Values are parsed with `strconv.ParseBool`; unparseable
   values log a warning and do not rotate.
+- For current-session logout, the backend sets `X-Session-Revoke: 1` (or the
+  configured `revoke_header`) on a successful response. gosestor gives this
+  signal precedence over every other response mutation: it drops all backend
+  cookies/control headers, atomically deletes the session, every proxy key,
+  cached cookie/hash, and owner-index membership, then expires `__gosestor`.
+  The signal is enabled by default; `revoke_header off` disables triggering
+  while still stripping the default header. Invalid/false values only strip.
+  A failed or lock-contended revocation always returns 502—even with
+  `on_store_error fail_open`—so logout can never appear successful while the
+  server-side session remains active. Stale concurrent responses cannot
+  recreate a revoked session or leave orphan keys/cookies.
 - With an `authz` block, gosestor enforces path-based authorization: `require`
   rules map path prefixes to labels (longest prefix wins, segment-aware,
   matched on the cleaned path), `require_default` covers unlisted paths, and
@@ -110,11 +132,13 @@ backend. See [`demo/README.md`](demo/README.md).
   fails closed.
 - The backend signals identity via `identity_header` with a **positive integer**
   owner id; `0` is the anonymous sentinel and negative values are ignored.
-- `identity_header` is stripped from both the request (anti-spoof) and response.
+- All backend control headers (`identity_header`, `rotate_header`,
+  `revoke_header`, and `labels_header`) are stripped from client requests and
+  trailers (anti-spoof) and from responses.
 - `on_store_error fail_closed` returns 502 rather than leaking backend cookies
   when the store is unreachable. On **any** response-path failure (either mode),
-  all `Set-Cookie`, the identity header, and the rotation header are scrubbed
-  before flushing — so under
+  all `Set-Cookie` and every managed control header are scrubbed before
+  flushing — so under
   `fail_open` a `forward`-listed cookie (e.g. a CSRF token) emitted during a
   transient store error is dropped rather than leaked.
 

@@ -165,7 +165,9 @@ Two independent limits, both from the schema:
   every access. Redis evicts idle sessions; no sweeper needed.
 - **`FINAL_TIMEOUT`** — absolute cap regardless of activity. Stored as
   `creation + final_timeout`; checked in code on each access. On refresh the applied
-  TTL is `min(inactive_timeout, final_deadline − now)`, so Redis never keeps a session
+  TTL is `min(inactive_timeout, final_deadline − now)`, with Redis `TIME` supplying
+  `now` inside each mutation script so queueing/network delay cannot move either
+  deadline, and Redis never keeps a session
   past its final deadline.
 
 Defaults configurable (`inactive_timeout 30m`, `final_timeout 8h`), overridable per-site.
@@ -175,16 +177,18 @@ Timeout logic is driven by an injected `Clock` interface for deterministic tests
 
 Rotation swaps the client-facing `KEY_ID` while keeping `SESSION_ID` and attributes intact:
 
-1. Generate `KEY_ID₂`; `SET gs:key:{KEY_ID₂} = SESSION_ID`; add to the session key-set.
-2. Emit the new proxy cookie to the client.
-3. **Hard-delete** the old `KEY_ID₁` immediately (no grace window). A grace window was
-   considered but rejected: because `Resolve` slides any live key's TTL back to the full
-   inactive window, a graced pre-login key could be used *after* login and renewed
-   indefinitely — defeating the fixation defense. Immediate deletion closes that window
-   entirely. Trade-off: a concurrent in-flight request still carrying the old key at the
-   login instant falls back to a fresh (unauthenticated) session; this is rare and low
-   impact. (`PutKey` precedes `DeleteKey`; on a partial store failure the new key is
-   orphaned but is never issued to the client.)
+1. Generate `KEY_ID₂`; atomically compare-and-swap `KEY_ID₁ → KEY_ID₂` only if
+   `KEY_ID₁` still maps to the live `SESSION_ID`, updating the reverse set in the same
+   Memory critical section or Redis Lua script.
+2. Apply the field-scoped owner/label mutation where applicable; roll the key swap back
+   if that mutation fails.
+3. Emit the new proxy cookie to the client. The old key has already been hard-deleted
+   with **no grace window**. A grace window was considered but rejected: because `Resolve`
+   slides any live key's TTL back to the full inactive window, a graced pre-login key
+   could be used *after* login and renewed indefinitely — defeating the fixation defense.
+   Immediate deletion closes that window entirely. A concurrent response can have only
+   one swap winner; losers cannot leave additional replacement keys valid or partially
+   revert owner/label state.
 
 **Triggers (v1):**
 - **Identity change** — fires **only on an `OWNER_ID` transition** (0→user or
@@ -239,7 +243,7 @@ example.com {
         }
         cookie {
             name       __gosestor
-            # path is optional: if omitted, NO Path attribute is written on the cookie
+            path       /              # defaults to /; custom paths must include logout routes
             same_site  lax            # lax | strict | none
             # http_only + secure ON by default; `insecure` disables secure (dev only)
         }

@@ -2,13 +2,16 @@ package gosestor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,7 +47,7 @@ type RedisConfig struct {
 // CookieConfig configures the client-facing proxy cookie.
 type CookieConfig struct {
 	Name     string `json:"name,omitempty"`
-	Path     string `json:"path,omitempty"` // empty => no Path attribute
+	Path     string `json:"path,omitempty"` // empty => "/"
 	SameSite string `json:"same_site,omitempty"`
 	Insecure bool   `json:"insecure,omitempty"`
 }
@@ -69,6 +72,10 @@ type Handler struct {
 	// the default name is still stripped from responses so backend signaling
 	// never reaches the client.
 	RotateHeader string `json:"rotate_header,omitempty"`
+	// RevokeHeader names the backend response header that revokes the current
+	// proxy session. Empty = default "X-Session-Revoke"; "off" disables the
+	// trigger while the default header remains stripped.
+	RevokeHeader string `json:"revoke_header,omitempty"`
 	// LabelsHeader names the backend response header that grants session
 	// labels (space/comma-separated; presence REPLACES the set, empty clears
 	// it). Empty = default "X-Session-Labels". Parsed and stripped even when
@@ -86,12 +93,17 @@ type Handler struct {
 	logger           *zap.Logger
 	rotateHeaderName string // effective header to read + strip
 	rotateEnabled    bool
+	revokeHeaderName string // effective current-session revoke header
+	revokeEnabled    bool
 	labelsHeaderName string // effective labels header to read + strip
 	authz            *authz.Authz
 }
 
 // defaultRotateHeader is the backend-facing rotation-request header name.
 const defaultRotateHeader = "X-Session-Rotate"
+
+// defaultRevokeHeader is the backend-facing current-session revocation header.
+const defaultRevokeHeader = "X-Session-Revoke"
 
 // defaultLabelsHeader is the backend-facing label-grant header name.
 const defaultLabelsHeader = "X-Session-Labels"
@@ -129,6 +141,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// defaults
 	h.Cookie.Name = "__gosestor"
+	h.Cookie.Path = "/"
 	h.Cookie.SameSite = "lax"
 	h.IdentityHeader = "X-Auth-User"
 	h.OnStoreError = "fail_closed"
@@ -247,6 +260,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.RotateHeader = d.Val()
+			case "revoke_header":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.RevokeHeader = d.Val()
 			case "labels_header":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -319,6 +337,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.FinalTimeout == 0 {
 		h.FinalTimeout = caddy.Duration(8 * time.Hour)
 	}
+	if h.Cookie.Path == "" {
+		h.Cookie.Path = "/"
+	}
 	h.redisClient = redis.NewClient(&redis.Options{
 		Addr: h.Redis.Address, Password: h.Redis.Password, DB: h.Redis.DB,
 	})
@@ -332,6 +353,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		RotateInterval: time.Duration(h.RotateInterval),
 	}, nil)
 	h.resolveRotateHeader()
+	h.resolveRevokeHeader()
 	h.labelsHeaderName = h.LabelsHeader
 	if h.labelsHeaderName == "" {
 		h.labelsHeaderName = defaultLabelsHeader
@@ -380,6 +402,20 @@ func (h *Handler) resolveRotateHeader() {
 	}
 }
 
+func (h *Handler) resolveRevokeHeader() {
+	switch {
+	case strings.EqualFold(h.RevokeHeader, "off"):
+		h.revokeHeaderName = defaultRevokeHeader
+		h.revokeEnabled = false
+	case h.RevokeHeader == "":
+		h.revokeHeaderName = defaultRevokeHeader
+		h.revokeEnabled = true
+	default:
+		h.revokeHeaderName = h.RevokeHeader
+		h.revokeEnabled = true
+	}
+}
+
 // Cleanup deregisters this handler from the admin revoke registry when the
 // config is unloaded — first, so a revoke can never race a closing client —
 // then closes the Redis pool, which would otherwise leak connections and
@@ -411,25 +447,36 @@ func (h *Handler) Validate() error {
 	if h.InactiveTimeout < 0 || h.FinalTimeout < 0 || h.RotateInterval < 0 {
 		return fmt.Errorf("session_store: inactive_timeout, final_timeout, and rotate_interval must not be negative")
 	}
-	// The rotation header and identity header must differ: one carries a
-	// boolean, the other an owner id — a shared name would make the backend's
-	// value ambiguous and one feature would silently eat the other's header.
+	// Every managed response header is stripped even when its trigger is off, so
+	// their effective names must remain distinct or one feature would silently
+	// consume another's value.
 	effRotate := h.RotateHeader
-	if effRotate == "" {
+	if effRotate == "" || strings.EqualFold(effRotate, "off") {
 		effRotate = defaultRotateHeader
 	}
-	if !strings.EqualFold(effRotate, "off") && strings.EqualFold(effRotate, h.IdentityHeader) {
-		return fmt.Errorf("session_store: rotate_header %q collides with identity_header", effRotate)
+	effRevoke := h.RevokeHeader
+	if effRevoke == "" || strings.EqualFold(effRevoke, "off") {
+		effRevoke = defaultRevokeHeader
 	}
-	// The labels header must differ from the identity and rotation headers —
-	// a shared name would make one feature silently eat another's grants.
 	effLabels := h.LabelsHeader
 	if effLabels == "" {
 		effLabels = defaultLabelsHeader
 	}
-	if strings.EqualFold(effLabels, h.IdentityHeader) ||
-		(!strings.EqualFold(effRotate, "off") && strings.EqualFold(effLabels, effRotate)) {
-		return fmt.Errorf("session_store: labels_header %q collides with another managed header", effLabels)
+	headers := []struct {
+		kind string
+		name string
+	}{
+		{"identity_header", h.IdentityHeader},
+		{"rotate_header", effRotate},
+		{"revoke_header", effRevoke},
+		{"labels_header", effLabels},
+	}
+	for i := range headers {
+		for j := i + 1; j < len(headers); j++ {
+			if strings.EqualFold(headers[i].name, headers[j].name) {
+				return fmt.Errorf("session_store: %s %q collides with %s", headers[i].kind, headers[i].name, headers[j].kind)
+			}
+		}
 	}
 	if h.Authz != nil {
 		if _, err := h.buildAuthz(); err != nil {
@@ -448,22 +495,58 @@ var (
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
 
+type trailerScrubbingBody struct {
+	io.ReadCloser
+	trailer http.Header
+	names   []string
+}
+
+func (b *trailerScrubbingBody) scrub() {
+	for _, name := range b.names {
+		b.trailer.Del(name)
+	}
+}
+
+func (b *trailerScrubbingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	// net/http populates request trailers as the body reaches EOF. Scrub after
+	// every read so late-arriving control trailers cannot reach the backend.
+	b.scrub()
+	return n, err
+}
+
+func (b *trailerScrubbingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.scrub()
+	return err
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ctx := r.Context()
 
-	// (0) Anti-spoof: never trust a client-supplied identity header. Trailers
-	// too — a trailer-borne copy would bypass the header strip and could reach
-	// a backend that reads trailers.
-	r.Header.Del(h.IdentityHeader)
-	if r.Trailer != nil {
-		r.Trailer.Del(h.IdentityHeader)
+	// (0) Anti-spoof: backend control headers are response-only. Never trust
+	// client-supplied copies, including trailers, because an echoing backend
+	// could otherwise turn them into grants, rotations, or revocation signals.
+	managedHeaders := []string{h.IdentityHeader, h.rotateHeaderName, h.revokeHeaderName, h.labelsHeaderName}
+	for _, name := range managedHeaders {
+		r.Header.Del(name)
+		if r.Trailer != nil {
+			r.Trailer.Del(name)
+		}
+	}
+	if r.Body != nil && r.Trailer != nil {
+		r.Body = &trailerScrubbingBody{ReadCloser: r.Body, trailer: r.Trailer, names: managedHeaders}
 	}
 
 	// (1-4) Resolve any existing session and inject cached cookies upstream.
 	var live *session.Live
+	var resolveErr error
+	hadProxyCookie := false
 	if c, err := r.Cookie(h.Cookie.Name); err == nil {
+		hadProxyCookie = true
 		l, err := h.manager.Resolve(ctx, c.Value)
 		if err != nil {
+			resolveErr = err
 			h.logger.Error("session store error", zap.String("op", "resolve"), zap.Error(err))
 			if h.OnStoreError == "fail_closed" {
 				return caddyhttp.Error(http.StatusBadGateway, err)
@@ -496,20 +579,98 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	h.prepareUpstreamCookies(r, cached)
 
 	// Response interception: process Set-Cookie + identity header before flush.
-	ic := &interceptor{ResponseWriter: w, h: h, r: r, live: live, ctx: ctx}
+	ic := &interceptor{
+		ResponseWriter: w, h: h, live: live, ctx: ctx,
+		hadProxyCookie: hadProxyCookie, resolveErr: resolveErr,
+		responseHeader: w.Header().Clone(),
+	}
+	defer func() { _ = ic.body.Close() }()
 	err := next.ServeHTTP(ic, r)
 	if err != nil {
+		// Nothing has reached the client yet: discard the staged body and every
+		// backend control/cookie without applying a session mutation.
+		ic.body.Reset()
+		ic.discardBackendMetadata()
+		clearHeaders(w.Header())
 		return err
 	}
-	// If body was never written (e.g. 0-length), ensure headers are processed.
+	if ic.hijacked {
+		return nil
+	}
 	ic.ensureProcessed()
-	if ic.storeErr != nil {
-		if ic.wroteHeader {
-			return nil // 502 already committed to the client by WriteHeader
+	if ic.failed {
+		ic.body.Reset()
+		clearHeaders(w.Header())
+		w.WriteHeader(http.StatusBadGateway)
+		return nil
+	}
+	ic.commitInformational(w)
+	copyHeaders(w.Header(), ic.Header())
+	if !ic.wroteHeader {
+		return nil
+	}
+	status := ic.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if ic.body.Len() > 0 {
+		if err := ic.body.FlushTo(w); err != nil {
+			return err
 		}
-		return caddyhttp.Error(http.StatusBadGateway, ic.storeErr)
 	}
 	return nil
+}
+
+func clearHeaders(h http.Header) {
+	for name := range h {
+		h.Del(name)
+	}
+}
+
+func stripManagedTrailerDeclarations(h http.Header, names ...string) {
+	managed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		managed[http.CanonicalHeaderKey(name)] = struct{}{}
+	}
+	var kept []string
+	for _, declaration := range h.Values("Trailer") {
+		for _, name := range strings.Split(declaration, ",") {
+			name = strings.TrimSpace(name)
+			if _, blocked := managed[http.CanonicalHeaderKey(name)]; blocked {
+				h.Del(name)
+			} else if name != "" {
+				kept = append(kept, name)
+			}
+		}
+	}
+	h.Del("Trailer")
+	if len(kept) > 0 {
+		h.Set("Trailer", strings.Join(kept, ", "))
+	}
+	for key := range h {
+		if strings.HasPrefix(strings.ToLower(key), strings.ToLower(http.TrailerPrefix)) {
+			name := key[len(http.TrailerPrefix):]
+			if _, blocked := managed[http.CanonicalHeaderKey(name)]; blocked {
+				h.Del(key)
+			}
+		}
+	}
+}
+
+// discardBackendMetadata prevents an errored downstream handler from leaking
+// response-only controls or cookies through Caddy's error response. It does not
+// apply any session mutation.
+func (ic *interceptor) discardBackendMetadata() {
+	ic.once.Do(func() {
+		h := ic.Header()
+		h.Del("Set-Cookie")
+		h.Del(ic.h.IdentityHeader)
+		h.Del(ic.h.rotateHeaderName)
+		h.Del(ic.h.revokeHeaderName)
+		h.Del(ic.h.labelsHeaderName)
+		stripManagedTrailerDeclarations(h, "Set-Cookie", ic.h.IdentityHeader, ic.h.rotateHeaderName, ic.h.revokeHeaderName, ic.h.labelsHeaderName)
+	})
 }
 
 // splitLabels tokenizes a labels header value on commas and whitespace.
@@ -580,63 +741,186 @@ var (
 	_ http.Hijacker = (*interceptor)(nil)
 )
 
-// interceptor rewrites response headers (Set-Cookie, identity) exactly once,
-// just before the first Write/WriteHeader.
-type interceptor struct {
-	http.ResponseWriter
-	h           *Handler
-	r           *http.Request
-	live        *session.Live
-	ctx         context.Context
-	once        sync.Once
-	failed      bool
-	wroteHeader bool
-	storeErr    error
+type stagedInformationalResponse struct {
+	status int
+	header http.Header
 }
 
+// interceptor stages normal HTTP responses until the downstream result is known.
+const stagedResponseMemoryLimit = 1 << 20
+
+type stagedBody struct {
+	memory bytes.Buffer
+	file   *os.File
+	size   int64
+}
+
+func (b *stagedBody) Write(p []byte) (int, error) {
+	if b.file == nil && b.memory.Len()+len(p) <= stagedResponseMemoryLimit {
+		n, err := b.memory.Write(p)
+		b.size += int64(n)
+		return n, err
+	}
+	if b.file == nil {
+		f, err := os.CreateTemp("", "gosestor-response-*")
+		if err != nil {
+			return 0, err
+		}
+		b.file = f
+		if _, err := f.Write(b.memory.Bytes()); err != nil {
+			_ = b.Close()
+			return 0, err
+		}
+		b.memory.Reset()
+	}
+	n, err := b.file.Write(p)
+	b.size += int64(n)
+	return n, err
+}
+
+func (b *stagedBody) FlushTo(w io.Writer) error {
+	if b.file == nil {
+		_, err := w.Write(b.memory.Bytes())
+		return err
+	}
+	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.Copy(w, b.file)
+	return err
+}
+
+func (b *stagedBody) Len() int { return int(b.size) }
+func (b *stagedBody) String() string {
+	if b.file == nil {
+		return b.memory.String()
+	}
+	return fmt.Sprintf("<%d staged bytes>", b.size)
+}
+func (b *stagedBody) Reset() {
+	b.memory.Reset()
+	b.size = 0
+	if b.file != nil {
+		name := b.file.Name()
+		_ = b.file.Close()
+		_ = os.Remove(name)
+		b.file = nil
+	}
+}
+func (b *stagedBody) Close() error {
+	if b.file == nil {
+		return nil
+	}
+	name := b.file.Name()
+	err := b.file.Close()
+	removeErr := os.Remove(name)
+	b.file = nil
+	if err != nil {
+		return err
+	}
+	return removeErr
+}
+
+type interceptor struct {
+	http.ResponseWriter
+	h               *Handler
+	live            *session.Live
+	ctx             context.Context
+	once            sync.Once
+	failed          bool
+	wroteHeader     bool
+	status          int
+	body            stagedBody
+	responseHeader  http.Header
+	informational   []stagedInformationalResponse
+	hijacked        bool
+	storeErr        error
+	revokeRequested bool
+	hadProxyCookie  bool
+	resolveErr      error
+}
+
+func copyHeaders(dst, src http.Header) {
+	clearHeaders(dst)
+	for name, values := range src {
+		dst[name] = append([]string(nil), values...)
+	}
+}
+
+func (ic *interceptor) Header() http.Header { return ic.responseHeader }
+
 func (ic *interceptor) WriteHeader(status int) {
-	ic.ensureProcessed()
-	ic.wroteHeader = true
-	if ic.failed {
-		ic.ResponseWriter.WriteHeader(http.StatusBadGateway)
+	if ic.wroteHeader {
 		return
 	}
-	ic.ResponseWriter.WriteHeader(status)
+	if status < 100 || status > 999 {
+		panic(fmt.Sprintf("invalid WriteHeader code %v", status))
+	}
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		ic.informational = append(ic.informational, stagedInformationalResponse{
+			status: status,
+			header: ic.Header().Clone(),
+		})
+		return
+	}
+	ic.wroteHeader = true
+	ic.status = status
 }
 
 func (ic *interceptor) Write(b []byte) (int, error) {
-	ic.ensureProcessed()
-	if ic.failed {
-		return len(b), nil // swallow upstream body on fail_closed
+	if !ic.wroteHeader {
+		ic.WriteHeader(http.StatusOK)
 	}
-	return ic.ResponseWriter.Write(b)
+	if ic.status == http.StatusNoContent || ic.status == http.StatusNotModified || (ic.status >= 100 && ic.status < 200) {
+		return 0, http.ErrBodyNotAllowed
+	}
+	return ic.body.Write(b)
 }
 
-// Flush implements http.Flusher so streaming responses (SSE) work through the
-// handler. Headers are processed first — deliberately no Unwrap() is offered,
-// since http.ResponseController reaching the underlying writer directly would
-// commit headers before the fail-safe scrub had a chance to run.
+// Flush records an implicit 200 but deliberately defers the actual flush until
+// the downstream handler returns successfully. This lets a later downstream
+// error discard all body, metadata, and session mutations.
 func (ic *interceptor) Flush() {
-	ic.ensureProcessed()
-	if ic.failed {
-		return // don't stream a body the fail_closed path is swallowing
-	}
-	if f, ok := ic.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	if !ic.wroteHeader {
+		ic.WriteHeader(http.StatusOK)
 	}
 }
 
-// Hijack implements http.Hijacker so proxied WebSocket upgrades work. Headers
-// are processed first so managed cookies and the identity header are filtered
-// before the connection leaves HTTP's control.
-func (ic *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	ic.ensureProcessed()
-	if ic.failed {
-		return nil, nil, fmt.Errorf("session_store: refusing hijack after response-path store failure")
+func (ic *interceptor) scrubManagedResponseHeader(h http.Header) {
+	stripManagedTrailerDeclarations(h, "Set-Cookie", ic.h.IdentityHeader, ic.h.rotateHeaderName, ic.h.revokeHeaderName, ic.h.labelsHeaderName)
+	h.Del("Set-Cookie")
+	h.Del(ic.h.IdentityHeader)
+	h.Del(ic.h.rotateHeaderName)
+	h.Del(ic.h.revokeHeaderName)
+	h.Del(ic.h.labelsHeaderName)
+}
+
+func (ic *interceptor) commitInformational(w http.ResponseWriter) {
+	for _, info := range ic.informational {
+		ic.scrubManagedResponseHeader(info.header)
+		copyHeaders(w.Header(), info.header)
+		w.WriteHeader(info.status)
 	}
+}
+
+// Hijacked responses cannot be buffered or rolled back. Refuse all managed
+// response metadata and session mutations, then delegate the raw connection.
+func (ic *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hj, ok := ic.ResponseWriter.(http.Hijacker)
 	if !ok {
 		return nil, nil, fmt.Errorf("session_store: underlying ResponseWriter does not support hijacking")
+	}
+	ic.discardBackendMetadata()
+	ic.hijacked = true
+	ic.commitInformational(ic.ResponseWriter)
+	copyHeaders(ic.ResponseWriter.Header(), ic.Header())
+	if ic.wroteHeader {
+		ic.ResponseWriter.WriteHeader(ic.status)
+	}
+	if ic.body.Len() > 0 {
+		if err := ic.body.FlushTo(ic.ResponseWriter); err != nil {
+			return nil, nil, err
+		}
 	}
 	return hj.Hijack()
 }
@@ -652,17 +936,20 @@ func (ic *interceptor) ensureProcessed() {
 		// Set-Cookie and the identity header regardless of on_store_error. Under
 		// fail_open the request still completes (no 502), just without a managed
 		// session; under fail_closed we additionally serve 502.
-		h := ic.ResponseWriter.Header()
+		h := ic.Header()
 		h.Del("Set-Cookie")
 		h.Del(ic.h.IdentityHeader)
 		h.Del(ic.h.rotateHeaderName)
+		h.Del(ic.h.revokeHeaderName)
 		h.Del(ic.h.labelsHeaderName)
 		fields := []zap.Field{zap.String("op", "response"), zap.Error(err)}
 		if ic.live != nil {
 			fields = append(fields, zap.String("sid", hashID(ic.live.SessionID)))
 		}
 		ic.h.logger.Error("session store error", fields...)
-		if ic.h.OnStoreError == "fail_closed" {
+		// An explicit logout must never appear successful if its server-side
+		// revocation failed, even when ordinary cache operations are fail_open.
+		if ic.h.OnStoreError == "fail_closed" || ic.revokeRequested {
 			ic.failed = true
 			ic.storeErr = err
 		}
@@ -671,6 +958,28 @@ func (ic *interceptor) ensureProcessed() {
 
 // process runs the response-path logic under an optional per-session lock.
 func (ic *interceptor) process() error {
+	// Parse and strip the revoke signal before lock acquisition so a contended
+	// logout is still recognized as security-critical and fails closed.
+	hdr := ic.Header()
+	stripManagedTrailerDeclarations(hdr, "Set-Cookie", ic.h.IdentityHeader, ic.h.rotateHeaderName, ic.h.revokeHeaderName, ic.h.labelsHeaderName)
+	rawRevoke := hdr.Values(ic.h.revokeHeaderName)
+	hdr.Del(ic.h.revokeHeaderName)
+	if ic.h.revokeEnabled {
+		for _, raw := range rawRevoke {
+			want, err := strconv.ParseBool(raw)
+			if err != nil {
+				ic.h.logger.Warn("invalid revoke header value",
+					zap.String("op", "response"), zap.String("value", raw))
+				continue
+			}
+			ic.revokeRequested = ic.revokeRequested || want
+		}
+	}
+
+	if ic.revokeRequested && ic.resolveErr != nil {
+		return fmt.Errorf("cannot revoke unresolved presented session: %w", ic.resolveErr)
+	}
+
 	run := func() error { return ic.processLocked() }
 	if ic.live != nil {
 		return ic.h.manager.WithLock(ic.ctx, ic.live.SessionID, run)
@@ -679,29 +988,43 @@ func (ic *interceptor) process() error {
 }
 
 func (ic *interceptor) processLocked() error {
-	hdr := ic.ResponseWriter.Header()
+	hdr := ic.Header()
 
 	// Capture and remove ALL backend Set-Cookie first, so no secret cookie can
 	// survive an early return during owner binding or storage.
 	setCookies := hdr.Values("Set-Cookie")
 	hdr.Del("Set-Cookie")
 
+	// An explicit current-session revocation takes precedence over every other
+	// response mutation. Strip all backend controls and cookies, delete the
+	// server-side session, and expire the opaque client key.
+	if ic.revokeRequested {
+		hdr.Del(ic.h.IdentityHeader)
+		hdr.Del(ic.h.rotateHeaderName)
+		hdr.Del(ic.h.labelsHeaderName)
+		if ic.live != nil {
+			if err := ic.live.Revoke(ic.ctx); err != nil {
+				return err
+			}
+			ic.live = nil
+		}
+		if ic.hadProxyCookie {
+			hdr.Add("Set-Cookie", ic.h.buildExpiredProxyCookie())
+		}
+		return nil
+	}
+
 	// (5) Owner binding from the backend's identity header, then strip it. The
 	// header is deleted unconditionally (even when empty) so it never reaches
 	// the client.
+	var ownerControl *int64
 	raw := hdr.Get(ic.h.IdentityHeader)
 	hdr.Del(ic.h.IdentityHeader)
 	if raw != "" {
 		ownerID, err := strconv.ParseInt(raw, 10, 64)
-		// Owner ids are positive integers; 0 is the anonymous sentinel. Guarding
-		// here (BindOwner also refuses) avoids minting a session just to no-op.
+		// Owner ids are positive integers; 0 is the anonymous sentinel.
 		if err == nil && ownerID > 0 {
-			if err := ic.ensureLive(); err != nil {
-				return err
-			}
-			if _, err := ic.live.BindOwner(ic.ctx, ownerID); err != nil {
-				return err
-			}
+			ownerControl = &ownerID
 		}
 	}
 
@@ -728,6 +1051,7 @@ func (ic *interceptor) processLocked() error {
 	// label set; absence changes nothing. Stripped unconditionally so backend
 	// grants never reach the client. The reserved "anonymous" label is a
 	// sentinel, not a privilege — grants naming it are dropped with a warning.
+	var labelsControl *[]string
 	rawLabels := hdr.Values(ic.h.labelsHeaderName)
 	hdr.Del(ic.h.labelsHeaderName)
 	if len(rawLabels) > 0 {
@@ -740,21 +1064,13 @@ func (ic *interceptor) processLocked() error {
 			}
 			kept = append(kept, lab)
 		}
-		// Don't mint a session just to hold an empty set — an empty grant to
-		// a session-less client is a no-op, not a session.
-		if ic.live != nil || len(kept) > 0 {
-			if err := ic.ensureLive(); err != nil {
-				return err
-			}
-			if _, err := ic.live.SetLabels(ic.ctx, kept); err != nil {
-				return err
-			}
-		}
+		labelsControl = &kept
 	}
 
 	// (6) Parse and filter each captured Set-Cookie. Malformed headers are
-	// rejected rather than treated as empty stored cookies. A stored cookie with
-	// deletion semantics removes the server-held value without minting a session.
+	// rejected rather than treated as empty stored cookies. Stored mutations are
+	// batched into the final old-key-CAS transition below.
+	var cookieMutations []session.CookieMutation
 	for _, sc := range setCookies {
 		cookie, err := http.ParseSetCookie(sc)
 		if err != nil {
@@ -767,35 +1083,30 @@ func (ic *interceptor) processLocked() error {
 		case filter.Store:
 			if cookieDeletesNow(sc, cookie, time.Now()) {
 				if ic.live != nil {
-					if err := ic.live.DeleteCookie(ic.ctx, cookie.Name); err != nil {
-						return err
-					}
+					cookieMutations = append(cookieMutations, session.CookieMutation{Name: cookie.Name, Delete: true})
 				}
 				continue
 			}
 			if err := ic.ensureLive(); err != nil {
 				return err
 			}
-			if err := ic.live.StoreCookie(ic.ctx, cookie.Name, cookie.Value); err != nil {
-				return err
-			}
+			cookieMutations = append(cookieMutations, session.CookieMutation{Name: cookie.Name, Value: cookie.Value})
 		case filter.Drop:
 			// omit entirely
 		}
 	}
 
-	// (6b) Rotation, executed only here — after the upstream completed, as the
-	// LAST fallible step, under the session lock. Any earlier failure returns
-	// before the old KEY_ID is touched, so the client's cookie is never
-	// invalidated without its replacement being guaranteed a spot in this
-	// response. A backend-requested rotation takes precedence; ForceRotate
-	// no-ops when this response already carries a fresh key.
+	// (6b) Commit owner, labels, and any requested/due rotation in one atomic
+	// transition after all cookie persistence. This is the final fallible step:
+	// a key swap cannot be followed by a cookie-store failure, and a CAS loser
+	// cannot partially change owner, labels, timestamps, or cascade TTLs.
+	if ic.live == nil && (ownerControl != nil || (labelsControl != nil && len(*labelsControl) > 0)) {
+		if err := ic.ensureLive(); err != nil {
+			return err
+		}
+	}
 	if ic.live != nil {
-		if rotateRequested {
-			if err := ic.live.ForceRotate(ic.ctx); err != nil {
-				return err
-			}
-		} else if err := ic.live.MaybeRotate(ic.ctx); err != nil {
+		if err := ic.live.ApplyResponse(ic.ctx, ownerControl, labelsControl, rotateRequested, cookieMutations); err != nil {
 			return err
 		}
 	}
@@ -822,15 +1133,41 @@ func (ic *interceptor) ensureLive() error {
 	return nil
 }
 
+func (h *Handler) proxyCookiePath() string {
+	if h.Cookie.Path == "" {
+		return "/"
+	}
+	return h.Cookie.Path
+}
+
 func (h *Handler) buildProxyCookie(value string) string {
 	c := &http.Cookie{
 		Name:     h.Cookie.Name,
 		Value:    value,
+		Path:     h.proxyCookiePath(),
 		HttpOnly: true,
 		Secure:   !h.Cookie.Insecure,
 	}
-	if h.Cookie.Path != "" { // no default Path
-		c.Path = h.Cookie.Path
+	switch strings.ToLower(h.Cookie.SameSite) {
+	case "strict":
+		c.SameSite = http.SameSiteStrictMode
+	case "none":
+		c.SameSite = http.SameSiteNoneMode
+	default:
+		c.SameSite = http.SameSiteLaxMode
+	}
+	return c.String()
+}
+
+func (h *Handler) buildExpiredProxyCookie() string {
+	c := &http.Cookie{
+		Name:     h.Cookie.Name,
+		Value:    "",
+		Path:     h.proxyCookiePath(),
+		HttpOnly: true,
+		Secure:   !h.Cookie.Insecure,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0).UTC(),
 	}
 	switch strings.ToLower(h.Cookie.SameSite) {
 	case "strict":

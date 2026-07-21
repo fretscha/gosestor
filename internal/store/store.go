@@ -9,6 +9,9 @@ import (
 // ErrNotFound is returned by getters when a session/key is absent or expired.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrConflict is returned when an atomic conditional mutation loses a race.
+var ErrConflict = errors.New("store: conflict")
+
 // Session mirrors the reference `session` table. Times and timeouts are Unix
 // seconds / seconds.
 type Session struct {
@@ -24,19 +27,48 @@ type Session struct {
 	Labels string
 }
 
+type CookieMutation struct {
+	Name   string
+	Value  string
+	SHA    string
+	Delete bool
+}
+
+type SessionControls struct {
+	SetOwner     bool
+	OwnerID      int64
+	SetLabels    bool
+	Labels       string
+	LastAccess   int64
+	LastRotation int64
+	OldKeyID     string
+	NewKeyID     string
+	Rotate       bool
+	Cookies      []CookieMutation
+}
+
 // Store is the persistence contract. Implementations: in-memory (tests) and
 // Redis (production). All methods take a context and must be safe for
 // concurrent use.
 type Store interface {
 	// Session rows.
 	PutSession(ctx context.Context, s Session, ttl time.Duration) error
+	// TouchSession slides access/TTL state without overwriting owner or labels.
+	// The legacyRotation value initializes a missing/zero last-rotation field.
+	TouchSession(ctx context.Context, sessionID, keyID string, lastAccess, legacyRotation int64, ttl time.Duration) error
+	// Conditional mutations return ErrNotFound rather than recreating a
+	// session that a concurrent logout already revoked.
+	ApplySessionControls(ctx context.Context, sessionID string, controls SessionControls, sessionTTL, ownerIndexTTL time.Duration) error
+	RotateSessionKey(ctx context.Context, sessionID, oldKeyID, newKeyID string, lastRotation int64, ttl time.Duration) error
 	GetSession(ctx context.Context, sessionID string) (Session, error) // ErrNotFound if absent
 	DeleteSession(ctx context.Context, sessionID string) error         // also removes keys + attrs
 
 	// key_id_map rows.
 	PutKey(ctx context.Context, keyID, sessionID string, ttl time.Duration) error
+	// ReplaceKey atomically swaps oldKeyID for newKeyID only while oldKeyID
+	// still maps to the live session. Concurrent losers return ErrConflict.
+	ReplaceKey(ctx context.Context, oldKeyID, newKeyID, sessionID string, ttl time.Duration) error
 	GetKey(ctx context.Context, keyID string) (sessionID string, err error) // ErrNotFound if absent
-	SetKeyTTL(ctx context.Context, keyID string, ttl time.Duration) error
 	DeleteKey(ctx context.Context, keyID string) error
 
 	// attribute rows (cached cookies): name -> value, plus name -> sha.
@@ -51,14 +83,12 @@ type Store interface {
 	AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string, ttl time.Duration) error
 	RemoveOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error
 	OwnerSessions(ctx context.Context, ownerID int64) ([]string, error)
-	// ReassignOwner persists the session and moves its owner-index membership as
-	// one atomic operation. DeleteSessionByOwner deletes only when the session is
-	// still owned by ownerID; it always prunes that owner's stale index member.
+	// ReassignOwner updates owner/access/rotation fields without overwriting
+	// unrelated session state, and moves owner-index membership atomically.
+	// DeleteSessionByOwner deletes only when the session is still owned by
+	// ownerID; it always prunes that owner's stale index member.
 	ReassignOwner(ctx context.Context, s Session, sessionTTL, ownerIndexTTL time.Duration) error
 	DeleteSessionByOwner(ctx context.Context, ownerID int64, sessionID string) (deleted bool, err error)
-
-	// Refresh slides the TTL on the session + its attribute keys.
-	Refresh(ctx context.Context, sessionID string, ttl time.Duration) error
 
 	// Lock takes a per-session advisory lock; returns (unlock, acquired, err).
 	// unlock is nil when acquired is false.

@@ -1,11 +1,14 @@
 package caddytest_test
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/caddyserver/caddy/v2/caddytest"
@@ -16,6 +19,29 @@ import (
 // stubBackend echoes control headers so tests can assert proxy behavior.
 func stubBackend(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/upgrade" {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("backend writer is not hijackable")
+				return
+			}
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("backend hijack: %v", err)
+				return
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: gosestor-test\r\nSet-Cookie: JSESSIONID=secret; Path=/\r\nX-Session-Revoke: 1\r\n\r\n")
+			if err := rw.Flush(); err != nil {
+				return
+			}
+			line, err := rw.ReadString('\n')
+			if err == nil {
+				_, _ = rw.WriteString("echo:" + line)
+				_ = rw.Flush()
+			}
+			return
+		}
 		// Report the Cookie header the backend received (for re-injection test).
 		w.Header().Set("X-Seen-Cookie", r.Header.Get("Cookie"))
 		// Echo the request's identity header into a differently-named response
@@ -27,6 +53,10 @@ func stubBackend(t *testing.T) *httptest.Server {
 		}
 		if r.URL.Path == "/logout" {
 			w.Header().Set("Set-Cookie", "JSESSIONID=; Max-Age=0; Path=/")
+		}
+		if r.URL.Path == "/session-logout" {
+			w.Header().Set("Set-Cookie", "JSESSIONID=; Max-Age=0; Path=/")
+			w.Header().Set("X-Session-Revoke", "1")
 		}
 		if r.URL.Path == "/tracker" {
 			w.Header().Set("Set-Cookie", "adtrack=noisy; Path=/") // unlisted → dropped
@@ -84,6 +114,7 @@ func harness(t *testing.T) (*caddytest.Tester, *httptest.Server, *miniredis.Mini
 			forward XSRF-TOKEN
 			store JSESSIONID
 			identity_header X-Auth-User
+			revoke_header X-Session-Revoke
 			on_store_error fail_closed
 		}
 		reverse_proxy %s
@@ -147,6 +178,61 @@ func TestStoredCookieHiddenAndReinjected(t *testing.T) {
 	}
 	if seen := afterResp.Header.Get("X-Seen-Cookie"); strings.Contains(seen, "JSESSIONID") {
 		t.Fatalf("expired stored cookie was re-injected: %q", seen)
+	}
+}
+
+func TestCurrentSessionLogoutRevokesProxySession(t *testing.T) {
+	tester, _, mr := harness(t)
+	login, _ := tester.AssertGetResponse("http://localhost:9080/login", 200, "ok\n")
+	var proxy *http.Cookie
+	for _, cookie := range login.Cookies() {
+		if cookie.Name == "__gosestor" {
+			proxy = cookie
+		}
+	}
+	if proxy == nil {
+		t.Fatal("login did not issue proxy cookie")
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost:9080/session-logout", nil)
+	req.AddCookie(proxy)
+	resp, err := tester.Client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout status = %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Session-Revoke"); got != "" {
+		t.Fatalf("revoke signal leaked: %q", got)
+	}
+	var expired bool
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "__gosestor" && cookie.MaxAge < 0 {
+			expired = true
+		}
+		if cookie.Name == "JSESSIONID" {
+			t.Fatalf("backend session cookie leaked: %+v", cookie)
+		}
+	}
+	if !expired {
+		t.Fatal("logout did not expire proxy cookie")
+	}
+	if mr.Exists("gs:key:" + proxy.Value) {
+		t.Fatal("old proxy key survived current-session logout")
+	}
+	if mr.Exists("gs:owner:42") {
+		t.Fatal("owner index survived current-session logout")
+	}
+
+	after, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/", nil)
+	after.AddCookie(proxy)
+	afterResp, err := tester.Client.Do(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen := afterResp.Header.Get("X-Seen-Cookie"); strings.Contains(seen, "JSESSIONID") {
+		t.Fatalf("revoked session cookie was re-injected: %q", seen)
 	}
 }
 
@@ -333,6 +419,7 @@ func authzHarness(t *testing.T) (*caddytest.Tester, *miniredis.Miniredis) {
 			}
 			store JSESSIONID
 			identity_header X-Auth-User
+			revoke_header X-Session-Revoke
 			on_store_error fail_closed
 			authz {
 				require /auth anonymous
@@ -447,5 +534,45 @@ func TestAuthzEndToEndJourney(t *testing.T) {
 	}
 	if r = get("/admin/panel", c3, "text/html"); r.StatusCode != http.StatusFound {
 		t.Fatalf("step 8: adm survived step-down (code %d)", r.StatusCode)
+	}
+}
+
+func TestUpgradeHandshakeIsCommittedAndManagedHeadersAreScrubbed(t *testing.T) {
+	_, _, _ = harness(t)
+	conn, err := net.DialTimeout("tcp", "localhost:9080", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprint(conn, "GET /upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: gosestor-test\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	var handshake strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read upgrade handshake: %v", err)
+		}
+		handshake.WriteString(line)
+		if line == "\r\n" {
+			break
+		}
+	}
+	raw := handshake.String()
+	if !strings.HasPrefix(raw, "HTTP/1.1 101 ") || !strings.Contains(raw, "Upgrade: gosestor-test\r\n") {
+		t.Fatalf("invalid upgrade handshake:\n%s", raw)
+	}
+	for _, forbidden := range []string{"JSESSIONID", "X-Session-Revoke"} {
+		if strings.Contains(strings.ToLower(raw), strings.ToLower(forbidden)) {
+			t.Fatalf("managed upgrade metadata %q leaked:\n%s", forbidden, raw)
+		}
+	}
+	if _, err := fmt.Fprint(conn, "ping\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || line != "echo:ping\n" {
+		t.Fatalf("upgraded connection exchange = %q, err=%v", line, err)
 	}
 }
