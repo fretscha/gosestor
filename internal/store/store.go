@@ -43,6 +43,7 @@ type Store interface {
 	GetCookies(ctx context.Context, sessionID string) (values map[string]string, err error)
 	CookieSHAs(ctx context.Context, sessionID string) (shas map[string]string, err error)
 	PutCookie(ctx context.Context, sessionID, name, value, sha string) error
+	DeleteCookie(ctx context.Context, sessionID, name string) error
 
 	// owner index. ttl bounds the whole owner set: it slides on every add, so a
 	// set that stops receiving logins expires instead of growing forever on

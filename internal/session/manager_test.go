@@ -109,7 +109,7 @@ func TestFinalTimeoutExpiresDespiteActivity(t *testing.T) {
 	t.Fatal("session never hit the final timeout")
 }
 
-func TestStoreCookieDedupe(t *testing.T) {
+func TestStoreCookiePersistsSameValue(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	m, st := newTestManager(clk)
 	ctx := context.Background()
@@ -122,9 +122,63 @@ func TestStoreCookieDedupe(t *testing.T) {
 	if vals["JSESSIONID"] != "abc" {
 		t.Fatalf("cookie not stored: %v", vals)
 	}
-	// Same value → sha match → no error, value unchanged.
+	// Repeating the same value remains a successful, authoritative write.
 	if err := live.StoreCookie(ctx, "JSESSIONID", "abc"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeleteCookieRemovesValueAndSHA(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, _ := m.Begin(ctx)
+	if err := live.StoreCookie(ctx, "JSESSIONID", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.DeleteCookie(ctx, "JSESSIONID"); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := st.GetCookies(ctx, live.SessionID)
+	shas, _ := st.CookieSHAs(ctx, live.SessionID)
+	if _, ok := vals["JSESSIONID"]; ok {
+		t.Fatalf("deleted cookie remains: %v", vals)
+	}
+	if _, ok := shas["JSESSIONID"]; ok {
+		t.Fatalf("deleted cookie SHA remains: %v", shas)
+	}
+	if _, ok := live.Cookies["JSESSIONID"]; ok {
+		t.Fatalf("deleted cookie remains on live handle: %v", live.Cookies)
+	}
+}
+
+func TestConcurrentDeleteThenSameValueSetRestoresCookie(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	original, _ := m.Begin(ctx)
+	if err := original.StoreCookie(ctx, "JSESSIONID", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := m.Resolve(ctx, original.KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Resolve(ctx, original.KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.DeleteCookie(ctx, "JSESSIONID"); err != nil {
+		t.Fatal(err)
+	}
+	// second was resolved before the delete and therefore carries the old SHA.
+	// Its later response explicitly setting the same value must restore it.
+	if err := second.StoreCookie(ctx, "JSESSIONID", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := st.GetCookies(ctx, original.SessionID)
+	if vals["JSESSIONID"] != "abc" {
+		t.Fatalf("later same-value Set-Cookie did not restore deletion: %v", vals)
 	}
 }
 

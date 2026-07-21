@@ -752,17 +752,31 @@ func (ic *interceptor) processLocked() error {
 		}
 	}
 
-	// (6) Filter each captured Set-Cookie: forward / store / drop.
+	// (6) Parse and filter each captured Set-Cookie. Malformed headers are
+	// rejected rather than treated as empty stored cookies. A stored cookie with
+	// deletion semantics removes the server-held value without minting a session.
 	for _, sc := range setCookies {
-		name, value := parseSetCookie(sc)
-		switch ic.h.filter.Decide(name) {
+		cookie, err := http.ParseSetCookie(sc)
+		if err != nil {
+			ic.h.logger.Warn("invalid backend Set-Cookie", zap.Error(err))
+			continue
+		}
+		switch ic.h.filter.Decide(cookie.Name) {
 		case filter.Forward:
 			hdr.Add("Set-Cookie", sc) // reaches the client unchanged
 		case filter.Store:
+			if cookieDeletesNow(sc, cookie, time.Now()) {
+				if ic.live != nil {
+					if err := ic.live.DeleteCookie(ic.ctx, cookie.Name); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			if err := ic.ensureLive(); err != nil {
 				return err
 			}
-			if err := ic.live.StoreCookie(ic.ctx, name, value); err != nil {
+			if err := ic.live.StoreCookie(ic.ctx, cookie.Name, cookie.Value); err != nil {
 				return err
 			}
 		case filter.Drop:
@@ -829,16 +843,53 @@ func (h *Handler) buildProxyCookie(value string) string {
 	return c.String()
 }
 
-// parseSetCookie extracts the name and value from a Set-Cookie header value.
-func parseSetCookie(sc string) (name, value string) {
-	first := sc
-	if i := strings.IndexByte(sc, ';'); i >= 0 {
-		first = sc[:i]
+// cookieDeletesNow reports whether a parsed Set-Cookie instructs the client to
+// remove the cookie. The raw header is inspected because net/http intentionally
+// normalizes Max-Age more strictly than RFC 6265's user-agent algorithm.
+func cookieDeletesNow(raw string, c *http.Cookie, now time.Time) bool {
+	if deletes, ok := maxAgeDeletes(raw); ok {
+		return deletes
 	}
-	if eq := strings.IndexByte(first, '='); eq >= 0 {
-		return strings.TrimSpace(first[:eq]), strings.TrimSpace(first[eq+1:])
+	return !c.Expires.IsZero() && !c.Expires.After(now)
+}
+
+// maxAgeDeletes returns the deletion decision from the last syntactically valid
+// Max-Age attribute. RFC 6265 accepts leading zeroes, rejects a leading plus,
+// and ignores invalid attributes. A valid non-positive value deletes now.
+func maxAgeDeletes(raw string) (deletes, ok bool) {
+	parts := strings.Split(raw, ";")
+	for _, part := range parts[1:] {
+		name, value, found := strings.Cut(part, "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(name), "Max-Age") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		negative := strings.HasPrefix(value, "-")
+		digits := value
+		if negative {
+			digits = value[1:]
+		}
+		if digits == "" {
+			continue
+		}
+		allZero := true
+		valid := true
+		for _, ch := range digits {
+			if ch < '0' || ch > '9' {
+				valid = false
+				break
+			}
+			if ch != '0' {
+				allZero = false
+			}
+		}
+		if !valid {
+			continue
+		}
+		ok = true
+		deletes = negative || allZero
 	}
-	return strings.TrimSpace(first), ""
+	return deletes, ok
 }
 
 // hashID returns a short, non-reversible tag for logging ids safely.

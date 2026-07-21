@@ -76,11 +76,12 @@ RESPONSE PATH (all mutations, wrapped in the interceptor)
 ──────────────────────────────────────────────────────────
 ensureProcessed() — runs EXACTLY ONCE, just before the
 first WriteHeader/Write/Flush/Hijack:
-  capture + remove ALL Set-Cookie             ┐
-  (5) bind owner from identity header, strip  │ under per-session
-  (6) filter each Set-Cookie: fwd/store/drop  │ lock when
-  (6b) MaybeRotate — the KEY swap, LAST       │ synchronize_sessions
-  (7) emit new __gosestor if key changed      ┘
+  capture + remove ALL Set-Cookie                 ┐
+  (5) bind owner from identity header, strip      │ under per-session
+  (6) parse + filter Set-Cookie: fwd/store/drop;  │ lock when
+      stored expiries delete cached value + SHA   │ synchronize_sessions
+  (6b) MaybeRotate — the KEY swap, LAST           │
+  (7) emit new __gosestor if key changed          ┘
 ```
 
 ### The interceptor
@@ -208,7 +209,7 @@ Redis layout (all under a configurable prefix):
 gs:key:<KEY_ID>        → SESSION_ID            (string, TTL)
 gs:sess:<SID>          → {creation, last_access, timeouts, owner_id, last_rotation}  (hash, TTL)
 gs:sess:<SID>:attr     → {JSESSIONID: value}   (cached cookies)
-gs:sess:<SID>:sha      → {JSESSIONID: sha}     (dedupe: skip write when unchanged)
+gs:sess:<SID>:sha      → {JSESSIONID: sha}     (companion value hash; deleted atomically)
 gs:sess:<SID>:keys     → set of KEY_IDs        (reverse index for delete cascade)
 gs:owner:<OWNER_ID>    → set of SIDs           (logout-everywhere; sliding TTL)
 gs:lock:<SID>          → random token          (SET NX + compare-and-delete Lua unlock)

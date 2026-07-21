@@ -68,7 +68,11 @@ backend. See [`demo/README.md`](demo/README.md).
 ## Behavior
 
 - `store` cookies are swallowed and kept server-side; `forward` cookies pass to
-  the client; everything else is dropped.
+  the client; everything else is dropped. A backend expiry for a stored cookie
+  (`Max-Age=0`, negative `Max-Age`, or an elapsed `Expires` without a positive
+  `Max-Age`) atomically removes its cached value and SHA, so it is not injected
+  on later requests. Malformed `Set-Cookie` values are dropped without minting
+  a session.
 - The client only receives an opaque `KEY_ID`; the internal `SESSION_ID` never
   leaves the server. On an authenticated identity change the `KEY_ID` rotates and
   the old key is **hard-deleted immediately** (session-fixation defense; no grace
@@ -133,10 +137,11 @@ control — no separate secret to manage.
 
 ## Operational notes
 
-- Any response carrying a `store`-listed `Set-Cookie` creates a session, even
-  for clients that never present a proxy cookie. Backends should not emit
-  managed session cookies on unauthenticated routes, or an attacker who ignores
-  the returned cookie can inflate Redis with anonymous sessions; put a rate
-  limiter in front of routes that mint sessions.
+- Any valid, non-expiring response carrying a `store`-listed `Set-Cookie` creates
+  a session, even for clients that never present a proxy cookie. Deletion
+  responses and malformed values do not. Backends should not emit managed
+  session cookies on unauthenticated routes, or an attacker who ignores the
+  returned cookie can inflate Redis with anonymous sessions; put a rate limiter
+  in front of routes that mint sessions.
 - Owner index sets (`<prefix>owner:<id>`) carry a TTL that slides on each login
   and are pruned on session delete/revoke, so they cannot grow unboundedly.
