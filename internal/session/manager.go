@@ -349,10 +349,7 @@ func (l *Live) BindOwner(ctx context.Context, ownerID int64) (bool, error) {
 		sess.LastRotation = now // the fixation rotation below also resets the periodic clock
 	}
 	ttl := l.m.ttl(sess, now)
-	if err := l.m.store.PutSession(ctx, sess, ttl); err != nil {
-		return false, err
-	}
-	if err := l.m.store.AddOwnerIndex(ctx, ownerID, l.SessionID, time.Duration(sess.FinalTimeout)*time.Second); err != nil {
+	if err := l.m.store.ReassignOwner(ctx, sess, ttl, time.Duration(sess.FinalTimeout)*time.Second); err != nil {
 		return false, err
 	}
 	l.OwnerID = ownerID
@@ -402,17 +399,10 @@ func (m *Manager) RevokeOwner(ctx context.Context, ownerID int64) error {
 	// on a transient error — and return the first error seen.
 	var firstErr error
 	for _, sid := range sids {
-		if err := m.store.DeleteSession(ctx, sid); err != nil {
+		if _, err := m.store.DeleteSessionByOwner(ctx, ownerID, sid); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
-			continue // keep the index entry so a retried revoke sees the sid
-		}
-		// Prune explicitly: DeleteSession can't prune sids whose session already
-		// TTL-expired (no owner_id left to read), so revoke — which knows the
-		// owner — sweeps every member it walked.
-		if err := m.store.RemoveOwnerIndex(ctx, ownerID, sid); err != nil && firstErr == nil {
-			firstErr = err
 		}
 	}
 	return firstErr

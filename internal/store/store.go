@@ -50,6 +50,11 @@ type Store interface {
 	AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string, ttl time.Duration) error
 	RemoveOwnerIndex(ctx context.Context, ownerID int64, sessionID string) error
 	OwnerSessions(ctx context.Context, ownerID int64) ([]string, error)
+	// ReassignOwner persists the session and moves its owner-index membership as
+	// one atomic operation. DeleteSessionByOwner deletes only when the session is
+	// still owned by ownerID; it always prunes that owner's stale index member.
+	ReassignOwner(ctx context.Context, s Session, sessionTTL, ownerIndexTTL time.Duration) error
+	DeleteSessionByOwner(ctx context.Context, ownerID int64, sessionID string) (deleted bool, err error)
 
 	// Refresh slides the TTL on the session + its attribute keys.
 	Refresh(ctx context.Context, sessionID string, ttl time.Duration) error

@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -442,6 +444,185 @@ func TestRevokeOwnerKillsAllSessions(t *testing.T) {
 	}
 	if _, err := st.GetSession(ctx, live.SessionID); err != store.ErrNotFound {
 		t.Fatalf("session survived revoke: %v", err)
+	}
+}
+
+// TestBindOwnerTransitionPrunesPreviousOwnerIndex: if a backend changes a
+// live session from owner A to owner B, revoking A must not delete B's session.
+func TestBindOwnerTransitionPrunesPreviousOwnerIndex(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m, st := newTestManager(clk)
+	ctx := context.Background()
+	live, err := m.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	key := live.KeyID
+	if sids, err := st.OwnerSessions(ctx, 7); err != nil || len(sids) != 0 {
+		t.Fatalf("previous owner index not pruned on transition: sids=%v err=%v", sids, err)
+	}
+
+	if err := m.RevokeOwner(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Resolve(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.OwnerID != 8 {
+		t.Fatalf("revoking previous owner deleted reassigned session: %+v", got)
+	}
+	if sids, err := st.OwnerSessions(ctx, 7); err != nil || len(sids) != 0 {
+		t.Fatalf("previous owner index not pruned: sids=%v err=%v", sids, err)
+	}
+}
+
+type failReassignStore struct {
+	store.Store
+	fail bool
+}
+
+func (s *failReassignStore) ReassignOwner(ctx context.Context, sess store.Session, sessionTTL, ownerIndexTTL time.Duration) error {
+	if s.fail {
+		s.fail = false
+		return errors.New("injected owner transition failure")
+	}
+	return s.Store.ReassignOwner(ctx, sess, sessionTTL, ownerIndexTTL)
+}
+
+func TestBindOwnerAtomicFailureCanBeRetried(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	mem := store.NewMemory()
+	failing := &failReassignStore{Store: mem}
+	m := NewManager(failing, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: false}, fixedRand())
+	ctx := context.Background()
+	live, err := m.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 41); err != nil {
+		t.Fatal(err)
+	}
+	failing.fail = true
+	if _, err := live.BindOwner(ctx, 42); err == nil {
+		t.Fatal("BindOwner succeeded despite injected atomic transition failure")
+	}
+	got, err := mem.GetSession(ctx, live.SessionID)
+	if err != nil || got.OwnerID != 41 || live.OwnerID != 41 {
+		t.Fatalf("failed transition became persistent: stored=%+v liveOwner=%d err=%v", got, live.OwnerID, err)
+	}
+	if _, err := live.BindOwner(ctx, 42); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	oldSIDs, _ := mem.OwnerSessions(ctx, 41)
+	newSIDs, _ := mem.OwnerSessions(ctx, 42)
+	if len(oldSIDs) != 0 || len(newSIDs) != 1 || newSIDs[0] != live.SessionID {
+		t.Fatalf("retry left inconsistent indexes: old=%v new=%v", oldSIDs, newSIDs)
+	}
+}
+
+type snapshotBlockingStore struct {
+	store.Store
+	snapshotted chan struct{}
+	resume      chan struct{}
+	once        sync.Once
+}
+
+func (s *snapshotBlockingStore) OwnerSessions(ctx context.Context, ownerID int64) ([]string, error) {
+	sids, err := s.Store.OwnerSessions(ctx, ownerID)
+	if err == nil && ownerID == 41 {
+		s.once.Do(func() {
+			close(s.snapshotted)
+			<-s.resume
+		})
+	}
+	return sids, err
+}
+
+func TestBindOwnerRaceWithRevokePreservesReassignedSession(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	mem := store.NewMemory()
+	blocking := &snapshotBlockingStore{Store: mem, snapshotted: make(chan struct{}), resume: make(chan struct{})}
+	m := NewManager(blocking, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: false}, fixedRand())
+	ctx := context.Background()
+	live, err := m.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 41); err != nil {
+		t.Fatal(err)
+	}
+	revokeDone := make(chan error, 1)
+	go func() { revokeDone <- m.RevokeOwner(ctx, 41) }()
+	<-blocking.snapshotted
+	if _, err := live.BindOwner(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	close(blocking.resume)
+	if err := <-revokeDone; err != nil {
+		t.Fatal(err)
+	}
+	got, err := mem.GetSession(ctx, live.SessionID)
+	if err != nil || got.OwnerID != 42 {
+		t.Fatalf("revoke deleted reassigned session: %+v, %v", got, err)
+	}
+}
+
+type reassignBlockingStore struct {
+	store.Store
+	block   bool
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (s *reassignBlockingStore) ReassignOwner(ctx context.Context, sess store.Session, sessionTTL, ownerIndexTTL time.Duration) error {
+	if s.block {
+		close(s.entered)
+		<-s.resume
+	}
+	return s.Store.ReassignOwner(ctx, sess, sessionTTL, ownerIndexTTL)
+}
+
+func TestRevokeWinningRacePreventsSessionRecreation(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	mem := store.NewMemory()
+	blocking := &reassignBlockingStore{Store: mem, entered: make(chan struct{}), resume: make(chan struct{})}
+	m := NewManager(blocking, clk, Config{Inactive: 30 * time.Minute, Final: 8 * time.Hour, RotateOnLogin: false}, fixedRand())
+	ctx := context.Background()
+	live, err := m.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.BindOwner(ctx, 41); err != nil {
+		t.Fatal(err)
+	}
+	blocking.block = true
+	bindDone := make(chan error, 1)
+	go func() {
+		_, err := live.BindOwner(ctx, 42)
+		bindDone <- err
+	}()
+	<-blocking.entered
+	if err := m.RevokeOwner(ctx, 41); err != nil {
+		t.Fatal(err)
+	}
+	close(blocking.resume)
+	if err := <-bindDone; !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("BindOwner after revoke error = %v, want ErrNotFound", err)
+	}
+	if _, err := mem.GetSession(ctx, live.SessionID); err != store.ErrNotFound {
+		t.Fatalf("revoked session was recreated: %v", err)
+	}
+	for _, ownerID := range []int64{41, 42} {
+		if sids, err := mem.OwnerSessions(ctx, ownerID); err != nil || len(sids) != 0 {
+			t.Fatalf("owner %d index after race: sids=%v err=%v", ownerID, sids, err)
+		}
 	}
 }
 
