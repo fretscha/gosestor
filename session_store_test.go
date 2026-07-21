@@ -983,6 +983,294 @@ func TestLabelsAnonymousGrantIgnored(t *testing.T) {
 	}
 }
 
+func TestCookieDeletesNow(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "max age zero", raw: "JSESSIONID=; Max-Age=0", want: true},
+		{name: "negative max age", raw: "JSESSIONID=; Max-Age=-1", want: true},
+		{name: "past expires", raw: "JSESSIONID=; Expires=Thu, 01 Jan 1970 00:00:00 GMT", want: true},
+		{name: "future expires", raw: "JSESSIONID=; Expires=Wed, 21 Jul 2038 00:00:00 GMT", want: false},
+		{name: "positive max age overrides past expires", raw: "JSESSIONID=kept; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:00 GMT", want: false},
+		{name: "leading-zero max age overrides past expires", raw: "JSESSIONID=kept; Max-Age=01; Expires=Thu, 01 Jan 1970 00:00:00 GMT", want: false},
+		{name: "plus-signed max age is ignored", raw: "JSESSIONID=; Max-Age=+1; Expires=Thu, 01 Jan 1970 00:00:00 GMT", want: true},
+		{name: "last valid max age wins set", raw: "JSESSIONID=kept; Max-Age=0; Max-Age=60", want: false},
+		{name: "last valid max age wins delete", raw: "JSESSIONID=; Max-Age=60; Max-Age=0", want: true},
+		{name: "invalid later max age is ignored", raw: "JSESSIONID=kept; Max-Age=60; Max-Age=+1; Expires=Thu, 01 Jan 1970 00:00:00 GMT", want: false},
+		{name: "empty value without expiry", raw: "JSESSIONID=", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cookie, err := http.ParseSetCookie(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cookieDeletesNow(tc.raw, cookie, now); got != tc.want {
+				t.Fatalf("cookieDeletesNow(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStoredCookieExpiryDeletesAndStopsReinjection(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setCookie string
+	}{
+		{name: "max age zero", setCookie: "JSESSIONID=; Max-Age=0; Path=/"},
+		{name: "past expires", setCookie: "JSESSIONID=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, mgr, st := newRotationTestHandler(clk)
+			live, err := mgr.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := live.StoreCookie(ctx, "JSESSIONID", "secret"); err != nil {
+				t.Fatal(err)
+			}
+			key := live.KeyID
+
+			req := httptest.NewRequest(http.MethodGet, "http://x/logout", nil)
+			req.Header.Set("Cookie", "__gosestor="+key)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				if c, err := r.Cookie("JSESSIONID"); err != nil || c.Value != "secret" {
+					t.Fatalf("stored cookie not injected before deletion: cookie=%+v err=%v", c, err)
+				}
+				w.Header().Set("Set-Cookie", tc.setCookie)
+				w.WriteHeader(http.StatusOK)
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := mgr.Resolve(ctx, key)
+			if err != nil || resolved == nil {
+				t.Fatalf("session lost while deleting cookie: live=%+v err=%v", resolved, err)
+			}
+			if _, ok := resolved.Cookies["JSESSIONID"]; ok {
+				t.Fatalf("expired cookie remained cached: %v", resolved.Cookies)
+			}
+			if shas, err := st.CookieSHAs(ctx, resolved.SessionID); err != nil || shas["JSESSIONID"] != "" {
+				t.Fatalf("expired cookie SHA remained: shas=%v err=%v", shas, err)
+			}
+
+			req2 := httptest.NewRequest(http.MethodGet, "http://x/after-logout", nil)
+			req2.Header.Set("Cookie", "__gosestor="+key)
+			rec2 := httptest.NewRecorder()
+			next2 := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				if c, err := r.Cookie("JSESSIONID"); err != http.ErrNoCookie {
+					t.Fatalf("deleted cookie reinjected: cookie=%+v err=%v", c, err)
+				}
+				w.WriteHeader(http.StatusOK)
+				return nil
+			})
+			if err := h.ServeHTTP(rec2, req2, next2); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+type deleteCookieFailStore struct{ store.Store }
+
+func (s *deleteCookieFailStore) DeleteCookie(context.Context, string, string) error {
+	return errors.New("delete cookie failed")
+}
+
+func TestDeleteCookieFailureScrubsResponseHeaders(t *testing.T) {
+	for _, mode := range []string{"fail_open", "fail_closed"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			base := store.NewMemory()
+			failing := &deleteCookieFailStore{Store: base}
+			mgr := session.NewManager(failing, clk, session.Config{
+				Inactive: 30 * time.Minute,
+				Final:    8 * time.Hour,
+			}, nil)
+			h := &Handler{
+				Cookie:           CookieConfig{Name: "__gosestor"},
+				IdentityHeader:   "X-Auth-User",
+				OnStoreError:     mode,
+				manager:          mgr,
+				store:            failing,
+				filter:           filter.New([]string{"XSRF-TOKEN"}, []string{"JSESSIONID"}),
+				logger:           zap.NewNop(),
+				rotateHeaderName: "X-Session-Rotate",
+				labelsHeaderName: "X-Session-Labels",
+			}
+			live, err := mgr.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := live.StoreCookie(ctx, "JSESSIONID", "secret"); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://x/logout", nil)
+			req.Header.Set("Cookie", "__gosestor="+live.KeyID)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.Header().Add("Set-Cookie", "JSESSIONID=; Max-Age=0")
+				w.Header().Add("Set-Cookie", "XSRF-TOKEN=forward-secret")
+				w.Header().Set("X-Auth-User", "42")
+				w.Header().Set("X-Session-Rotate", "1")
+				w.Header().Set("X-Session-Labels", "adm")
+				w.WriteHeader(http.StatusOK)
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			result := rec.Result()
+			wantStatus := http.StatusOK
+			if mode == "fail_closed" {
+				wantStatus = http.StatusBadGateway
+			}
+			if result.StatusCode != wantStatus {
+				t.Fatalf("status = %d, want %d", result.StatusCode, wantStatus)
+			}
+			if got := result.Header.Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("Set-Cookie leaked after delete failure: %v", got)
+			}
+			for _, name := range []string{"X-Auth-User", "X-Session-Rotate", "X-Session-Labels"} {
+				if got := result.Header.Get(name); got != "" {
+					t.Fatalf("%s leaked after delete failure: %q", name, got)
+				}
+			}
+		})
+	}
+}
+
+func TestDuplicateStoredSetCookieHeadersApplyInOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers []string
+		want    string
+		present bool
+	}{
+		{
+			name:    "set then delete",
+			headers: []string{"JSESSIONID=new; Path=/", "JSESSIONID=; Max-Age=0; Path=/"},
+			present: false,
+		},
+		{
+			name:    "delete then set",
+			headers: []string{"JSESSIONID=; Max-Age=0; Path=/", "JSESSIONID=new; Path=/"},
+			want:    "new",
+			present: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			clk := &testClock{t: time.Unix(1_000_000, 0)}
+			h, mgr, _ := newRotationTestHandler(clk)
+			live, err := mgr.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := live.StoreCookie(ctx, "JSESSIONID", "old"); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+			req.Header.Set("Cookie", "__gosestor="+live.KeyID)
+			rec := httptest.NewRecorder()
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				for _, header := range tc.headers {
+					w.Header().Add("Set-Cookie", header)
+				}
+				w.WriteHeader(http.StatusOK)
+				return nil
+			})
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := mgr.Resolve(ctx, live.KeyID)
+			if err != nil || resolved == nil {
+				t.Fatalf("session did not resolve: live=%+v err=%v", resolved, err)
+			}
+			got, present := resolved.Cookies["JSESSIONID"]
+			if present != tc.present || got != tc.want {
+				t.Fatalf("final cookie = %q present=%v, want %q present=%v", got, present, tc.want, tc.present)
+			}
+		})
+	}
+}
+
+func TestExpiredStoredCookieWithoutSessionMintsNothing(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	req := httptest.NewRequest(http.MethodGet, "http://x/logout", nil)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Set-Cookie", "JSESSIONID=; Max-Age=0; Path=/")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Result().Header.Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("expiry without a live session minted one: %v", got)
+	}
+}
+
+func TestEmptyStoredCookieWithoutExpiryIsStored(t *testing.T) {
+	ctx := context.Background()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, mgr, _ := newRotationTestHandler(clk)
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Set-Cookie", "JSESSIONID=; Path=/")
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == "__gosestor" {
+			key = cookie.Value
+		}
+	}
+	if key == "" {
+		t.Fatal("empty non-expiring stored cookie did not mint a session")
+	}
+	live, err := mgr.Resolve(ctx, key)
+	if err != nil || live == nil {
+		t.Fatalf("minted session does not resolve: live=%+v err=%v", live, err)
+	}
+	value, ok := live.Cookies["JSESSIONID"]
+	if !ok || value != "" {
+		t.Fatalf("empty non-expiring cookie not stored: %v", live.Cookies)
+	}
+}
+
+func TestMalformedStoredSetCookieIsDroppedWithoutMintingSession(t *testing.T) {
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	h, _, _ := newRotationTestHandler(clk)
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Set-Cookie", "JSESSIONID") // invalid: no '='
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Result().Header.Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("malformed stored cookie minted or leaked a session: %v", got)
+	}
+}
+
 // TestLabelsHeaderAbsentNoChange: a response without the header leaves the
 // set untouched and triggers no rotation.
 func TestLabelsHeaderAbsentNoChange(t *testing.T) {

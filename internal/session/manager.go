@@ -313,19 +313,30 @@ func (l *Live) NewProxyCookie() (string, bool) {
 	return "", false
 }
 
-// StoreCookie writes a cached cookie, skipping the write when the value is
-// unchanged (VALUE_SHA dedupe).
+// StoreCookie persists an explicit backend cookie response and its value hash.
+// The write is never skipped from local state because a concurrent response may
+// have deleted the persisted value after this Live handle was resolved.
 func (l *Live) StoreCookie(ctx context.Context, name, value string) error {
 	sum := sha256.Sum256([]byte(value))
 	sha := base64.RawURLEncoding.EncodeToString(sum[:])
-	if l.shas[name] == sha {
-		return nil // unchanged; skip rewrite
-	}
+	// Always persist an explicit backend Set-Cookie. This Live handle may have
+	// been resolved before a concurrent response deleted the same value, so its
+	// local SHA is not authoritative even when it matches.
 	if err := l.m.store.PutCookie(ctx, l.SessionID, name, value, sha); err != nil {
 		return err
 	}
 	l.Cookies[name] = value
 	l.shas[name] = sha
+	return nil
+}
+
+// DeleteCookie removes a cached backend cookie and its change-detection hash.
+func (l *Live) DeleteCookie(ctx context.Context, name string) error {
+	if err := l.m.store.DeleteCookie(ctx, l.SessionID, name); err != nil {
+		return err
+	}
+	delete(l.Cookies, name)
+	delete(l.shas, name)
 	return nil
 }
 

@@ -199,3 +199,49 @@ func TestRedisOwnerIDsAboveFloatPrecisionRemainDistinct(t *testing.T) {
 		t.Fatalf("reassigned large-owner session missing: session=%+v err=%v", got, err)
 	}
 }
+
+func TestRedisDeleteCookieFailureLeavesValueAndSHAUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		wrongTypeKey  string
+		wantCookie    bool
+		wantCookieSHA bool
+	}{
+		{name: "attribute hash wrong type", wrongTypeKey: "gs:sess:sid:attr", wantCookie: false, wantCookieSHA: true},
+		{name: "SHA hash wrong type", wrongTypeKey: "gs:sess:sid:sha", wantCookie: true, wantCookieSHA: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mr, err := miniredis.Run()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(mr.Close)
+			client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+			r := NewRedis(client, "gs:")
+			if err := r.PutCookie(ctx, "sid", "JSESSIONID", "secret", "sha"); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Del(ctx, tc.wrongTypeKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Set(ctx, tc.wrongTypeKey, "wrong type", 0).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.DeleteCookie(ctx, "sid", "JSESSIONID"); err == nil {
+				t.Fatal("DeleteCookie succeeded with a wrong-typed hash")
+			}
+			cookieExists, err := client.HExists(ctx, "gs:sess:sid:attr", "JSESSIONID").Result()
+			if err != nil && tc.wantCookie {
+				t.Fatal(err)
+			}
+			shaExists, err := client.HExists(ctx, "gs:sess:sid:sha", "JSESSIONID").Result()
+			if err != nil && tc.wantCookieSHA {
+				t.Fatal(err)
+			}
+			if cookieExists != tc.wantCookie || shaExists != tc.wantCookieSHA {
+				t.Fatalf("failed delete changed peer hash: cookie=%v sha=%v", cookieExists, shaExists)
+			}
+		})
+	}
+}

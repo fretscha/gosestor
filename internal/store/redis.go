@@ -142,6 +142,27 @@ func (r *Redis) PutCookie(ctx context.Context, sessionID, name, value, sha strin
 	return err
 }
 
+const deleteCookieScript = `
+local function require_hash(key)
+  local actual = redis.call("TYPE", key)["ok"]
+  if actual ~= "none" and actual ~= "hash" then
+    return redis.error_reply("WRONGTYPE " .. key .. " must be hash")
+  end
+end
+local err = require_hash(KEYS[1])
+if err then return err end
+err = require_hash(KEYS[2])
+if err then return err end
+redis.call("HDEL", KEYS[1], ARGV[1])
+redis.call("HDEL", KEYS[2], ARGV[1])
+return 1
+`
+
+func (r *Redis) DeleteCookie(ctx context.Context, sessionID, name string) error {
+	return r.c.Eval(ctx, deleteCookieScript,
+		[]string{r.attrKey(sessionID), r.shaKey(sessionID)}, name).Err()
+}
+
 func (r *Redis) AddOwnerIndex(ctx context.Context, ownerID int64, sessionID string, ttl time.Duration) error {
 	pipe := r.c.TxPipeline()
 	pipe.SAdd(ctx, r.ownerKey(ownerID), sessionID)

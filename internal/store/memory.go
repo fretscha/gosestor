@@ -115,6 +115,14 @@ func (m *Memory) PutCookie(_ context.Context, sessionID, name, value, sha string
 	return nil
 }
 
+func (m *Memory) DeleteCookie(_ context.Context, sessionID, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.cookies[sessionID], name)
+	delete(m.shas[sessionID], name)
+	return nil
+}
+
 func (m *Memory) AddOwnerIndex(_ context.Context, ownerID int64, sessionID string, _ time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

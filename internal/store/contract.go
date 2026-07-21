@@ -63,6 +63,20 @@ func RunContract(t *testing.T, newStore func() Store) {
 		if shas["JSESSIONID"] != "sha1" {
 			t.Fatalf("shas = %v", shas)
 		}
+		if err := s.DeleteCookie(ctx, "sid", "JSESSIONID"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteCookie(ctx, "sid", "JSESSIONID"); err != nil {
+			t.Fatalf("repeated DeleteCookie must be idempotent: %v", err)
+		}
+		vals, _ = s.GetCookies(ctx, "sid")
+		shas, _ = s.CookieSHAs(ctx, "sid")
+		if _, ok := vals["JSESSIONID"]; ok {
+			t.Fatalf("deleted cookie remains: %v", vals)
+		}
+		if _, ok := shas["JSESSIONID"]; ok {
+			t.Fatalf("deleted cookie SHA remains: %v", shas)
+		}
 	})
 
 	t.Run("owner index", func(t *testing.T) {

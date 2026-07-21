@@ -25,6 +25,9 @@ func stubBackend(t *testing.T) *httptest.Server {
 			w.Header().Set("Set-Cookie", "JSESSIONID=secret-sess; Path=/")
 			w.Header().Set("X-Auth-User", "42")
 		}
+		if r.URL.Path == "/logout" {
+			w.Header().Set("Set-Cookie", "JSESSIONID=; Max-Age=0; Path=/")
+		}
 		if r.URL.Path == "/tracker" {
 			w.Header().Set("Set-Cookie", "adtrack=noisy; Path=/") // unlisted → dropped
 		}
@@ -119,6 +122,31 @@ func TestStoredCookieHiddenAndReinjected(t *testing.T) {
 	}
 	if seen := r2.Header.Get("X-Seen-Cookie"); !strings.Contains(seen, "JSESSIONID=secret-sess") {
 		t.Fatalf("cached cookie not re-injected upstream: %q", seen)
+	}
+
+	// Backend expiry removes the server-held cookie while preserving the proxy
+	// session. The expiry header itself stays hidden from the client.
+	logoutReq, _ := http.NewRequest("GET", "http://localhost:9080/logout", nil)
+	logoutReq.AddCookie(proxy)
+	logoutResp, err := tester.Client.Do(logoutReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen := logoutResp.Header.Get("X-Seen-Cookie"); !strings.Contains(seen, "JSESSIONID=secret-sess") {
+		t.Fatalf("cached cookie not injected into logout request: %q", seen)
+	}
+	if got := logoutResp.Header.Get("Set-Cookie"); strings.Contains(got, "JSESSIONID") {
+		t.Fatalf("stored-cookie expiry leaked to client: %q", got)
+	}
+
+	afterReq, _ := http.NewRequest("GET", "http://localhost:9080/", nil)
+	afterReq.AddCookie(proxy)
+	afterResp, err := tester.Client.Do(afterReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen := afterResp.Header.Get("X-Seen-Cookie"); strings.Contains(seen, "JSESSIONID") {
+		t.Fatalf("expired stored cookie was re-injected: %q", seen)
 	}
 }
 
